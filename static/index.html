@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SQL Redis Visual Tool</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">SR</span>
+        <div>
+          <h1>SQL Redis</h1>
+          <p>数据表工具</p>
+        </div>
+      </div>
+      <div class="status-row">
+        <span id="sqlStatus" class="status-dot pending"></span>
+        <span>SQL</span>
+        <span id="redisStatus" class="status-dot pending"></span>
+        <span>Redis</span>
+      </div>
+      <div class="sidebar-section">
+        <div class="section-header">
+          <div class="section-title">连接</div>
+          <button id="newConnectionButton" type="button">新建连接</button>
+        </div>
+        <div id="connectionList" class="connection-list"></div>
+      </div>
+    </aside>
+
+    <div id="sidebarResizeHandle" class="resize-handle" title="拖动调整左侧宽度"></div>
+
+    <main class="workspace">
+      <header class="toolbar">
+        <div>
+          <h2 id="viewTitle">选择数据表</h2>
+          <p id="viewMeta">连接后可浏览、查询和编辑数据</p>
+        </div>
+        <div class="toolbar-actions">
+          <button id="addRowButton" type="button" disabled>新增行</button>
+          <button id="deleteRowsButton" type="button" disabled>删除选中</button>
+          <button id="commitButton" type="button" disabled>提交更新</button>
+          <button id="refreshButton" type="button" title="刷新">刷新</button>
+        </div>
+      </header>
+
+      <nav id="tabBar" class="tab-bar"></nav>
+
+      <section class="query-panel">
+        <textarea id="sqlEditor" spellcheck="false">select * from sqlite_master</textarea>
+        <div class="query-actions">
+          <input id="limitInput" type="number" min="1" max="1000" value="100" title="SQL 查询默认限制行数">
+          <button id="runQueryButton" type="button">执行 SQL</button>
+        </div>
+      </section>
+
+      <section class="data-panel">
+        <div id="message" class="message"></div>
+        <div class="table-wrap">
+          <table id="dataTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <div id="connectionModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="connectionModalTitle">
+      <div class="modal-panel">
+        <div class="modal-header">
+          <h3 id="connectionModalTitle">新建连接</h3>
+          <button id="closeConnectionModal" type="button" title="关闭">关闭</button>
+        </div>
+        <form id="connectionForm" class="connection-form">
+          <input id="connectionName" type="text" placeholder="连接名称" autocomplete="off">
+          <div class="mode-tabs">
+            <label><input type="radio" name="connectionMode" value="dsn" checked> 连接串</label>
+            <label><input type="radio" name="connectionMode" value="fields"> IP/Port</label>
+          </div>
+          <div id="dsnFields" class="form-group">
+            <select id="driverSelect" title="数据库类型">
+              <option value="mysql" selected>MySQL</option>
+              <option value="sqlite">SQLite</option>
+              <option value="postgresql">PostgreSQL</option>
+              <option value="clickhouse">ClickHouse</option>
+            </select>
+            <textarea id="dsnInput" spellcheck="false" placeholder="local_user:local_password@(127.0.0.1:3306)/local_db?charset=utf8&loc=Asia%2FShanghai&parseTime=true"></textarea>
+          </div>
+          <div id="fieldInputs" class="form-group hidden">
+            <input id="dbHost" type="text" placeholder="IP / Host" autocomplete="off">
+            <input id="dbPort" type="number" min="1" max="65535" placeholder="端口" autocomplete="off">
+            <input id="dbUser" type="text" placeholder="用户名" autocomplete="off">
+            <input id="dbPassword" type="password" placeholder="密码" autocomplete="off">
+            <input id="dbName" type="text" placeholder="数据库名" autocomplete="off">
+          </div>
+          <input id="sqlUrl" type="text" placeholder="生成的 SQL URL" autocomplete="off">
+          <input id="redisUrl" type="text" placeholder="Redis URL" autocomplete="off">
+          <div class="modal-actions">
+            <button id="cancelConnectionButton" type="button">取消</button>
+            <button type="submit">保存连接</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
