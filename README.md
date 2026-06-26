@@ -136,3 +136,144 @@ python sql_redis_tool.py sync-table \
   --prefix user \
   --ttl 3600
 ```
+
+---
+
+# SQL Redis Visual Tool
+
+A lightweight visual tool for working with SQL databases and Redis. It includes:
+
+- FastAPI backend APIs
+- Native HTML/CSS/JavaScript frontend
+- SQL table browsing
+- `SELECT` SQL query execution
+- Direct cell editing in a visual data grid
+- Browser-side database connection management
+- Redis connection checks and key inspection APIs
+- The original CLI utilities for SQL query caching and table synchronization
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+If you want to connect to MySQL or PostgreSQL, enable or install the matching driver dependency in `requirements.txt`.
+
+## Configuration
+
+The web frontend lets you add database connections directly. Connection details are stored in browser `localStorage`, so they remain visible after refreshing or reopening the page. The app does not automatically connect to a database; it only sends connection details to the backend when you click a saved connection.
+
+You can use the default SQLite database in the current directory:
+
+```bash
+sqlite:///app.db
+redis://localhost:6379/0
+```
+
+You can also add a MySQL connection in the frontend:
+
+```text
+mysql+pymysql://user:password@localhost:3306/app
+```
+
+Or PostgreSQL:
+
+```text
+postgresql+psycopg://user:password@localhost:5432/app
+```
+
+## Run The Web App
+
+Start everything with one command:
+
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+The script caches a fingerprint of `requirements.txt`. If dependencies have not changed, it skips installation on the next run. To force dependency installation:
+
+```bash
+FORCE_INSTALL=1 ./start.sh
+```
+
+Create a demo SQLite database first:
+
+```bash
+python scripts/create_demo_db.py
+```
+
+Start the server:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+## Frontend Features
+
+- Add a connection by entering a connection name, SQL URL, and Redis URL
+- Open the connection modal from the "New Connection" button
+- Use DSN mode with strings such as `local_user:local_password@(127.0.0.1:3306)/local_db?charset=utf8&loc=Asia%2FShanghai&parseTime=true`
+- Use IP/Port mode to generate a SQL URL from driver, host, port, username, password, and database name
+- Store connections locally and show them again after refresh or reopen
+- Connect manually by clicking a saved connection
+- Edit saved connections and preview SQL / Redis connection info on hover
+- Open multiple table tabs from different database connections at the same time
+- Show each connection's tables in the sidebar
+- Expand each table to inspect columns, foreign keys, and indexes
+- Load table data visually, with the first 100 rows loaded by default and more rows loaded while scrolling
+- Open a table tab with the table name and connection address in the workspace title
+- Edit non-primary-key cells for tables that have a primary key, then persist changes with "Commit Updates"
+- Select rows and mark them for deletion, then delete them with "Commit Updates"
+- Add virtual rows with "Add Row", fill values, then insert them with "Commit Updates"
+- Run `SELECT` / `WITH` queries from the SQL editor
+- Limit ad hoc SQL queries to 100 rows by default and keep query results read-only
+
+## API
+
+```text
+GET    /api/health
+POST   /api/connections/test
+POST   /api/tables
+POST   /api/tables/{table_name}/rows
+PATCH  /api/tables/{table_name}/cell
+POST   /api/tables/{table_name}/rows/insert
+POST   /api/tables/{table_name}/rows/delete
+POST   /api/query
+POST   /api/redis/keys
+POST   /api/redis/value
+```
+
+## CLI Usage
+
+Check connections:
+
+```bash
+python sql_redis_tool.py health
+```
+
+Run a SQL query and cache the result for 300 seconds:
+
+```bash
+python sql_redis_tool.py query-cache \
+  --sql "select id, name from users where id = :id" \
+  --params '{"id": 1}' \
+  --ttl 300
+```
+
+Sync a SQL table into Redis hashes:
+
+```bash
+python sql_redis_tool.py sync-table \
+  --table users \
+  --id-column id \
+  --prefix user \
+  --ttl 3600
+```
