@@ -71,13 +71,21 @@
       </section>
     </main>
 
+    <div id="aiResizeHandle" class="ai-resize-handle" title="拖动调整 AI 助手宽度"></div>
+
     <aside class="ai-panel" id="aiAssistantPanel">
       <header class="ai-header">
         <div>
-          <h2>AI 助手</h2>
+          <div class="ai-title-row">
+            <h2>AI 助手</h2>
+            <span id="aiBackendBadge" class="ai-backend-badge pending">检测中</span>
+          </div>
           <p id="aiConfigStatus">检查配置中...</p>
         </div>
-        <button id="aiResetButton" type="button" title="重置会话">重置</button>
+        <div class="ai-header-actions">
+          <button id="aiResetButton" type="button" title="重置会话">重置</button>
+          <button id="aiCloseButton" class="icon-button" type="button" title="关闭 AI 助手" aria-label="关闭 AI 助手">›</button>
+        </div>
       </header>
       <div class="ai-controls">
         <select id="aiModelSelect" title="选择 AI 模型"></select>
@@ -96,6 +104,8 @@
         <button id="aiSendButton" type="submit">发送</button>
       </form>
     </aside>
+
+    <button id="aiOpenButton" class="ai-open-button hidden" type="button" title="打开 AI 助手" aria-label="打开 AI 助手">‹</button>
 
     <div id="connectionModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="connectionModalTitle">
       <div class="modal-panel">
@@ -158,6 +168,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=ai-models-20260626-1"></script>
+    <script src="/static/app.js?v=ai-markdown-20260626-1"></script>
   </body>
 </html>

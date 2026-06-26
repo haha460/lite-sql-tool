@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "huayan/gpt-5.5-pro",
+  "provider": {
+    "huayan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Huayan API",
+      "options": {
+        "baseURL": "{env:HUAYAN_API_BASE}",
+        "apiKey": "{env:HUAYAN_API_KEY}"
+      },
+      "models": {
+        "gpt-5.5-pro": {
+          "name": "GPT 5.5 Pro"
+        },
+        "glm-5.2": {
+          "name": "GLM 5.2"
+        }
+      }
+    }
+  }
+}

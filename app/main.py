@@ -175,6 +175,7 @@ def list_tables(connection: ConnectionInfo) -> dict[str, Any]:
                     "name": table_name,
                     "primary_key": pk[0] if pk else None,
                     "row_count": stats.get("row_count"),
+                    "row_count_estimated": stats.get("row_count_estimated"),
                     "size_bytes": stats.get("size_bytes"),
                     "columns": [
                         {
@@ -416,8 +417,8 @@ def safe_inspect_list(fn: Any, table_name: str) -> list[dict[str, Any]]:
     return value if isinstance(value, list) else []
 
 
-def load_table_stats(engine: Engine, table_names: list[str]) -> dict[str, dict[str, int | None]]:
-    stats = {name: {"row_count": None, "size_bytes": None} for name in table_names}
+def load_table_stats(engine: Engine, table_names: list[str]) -> dict[str, dict[str, Any]]:
+    stats = {name: {"row_count": None, "row_count_estimated": False, "size_bytes": None} for name in table_names}
     if not table_names:
         return stats
 
@@ -436,7 +437,7 @@ def load_table_stats(engine: Engine, table_names: list[str]) -> dict[str, dict[s
     return stats
 
 
-def load_mysql_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+def load_mysql_table_stats(engine: Engine, stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     sql = """
         select
           table_name,
@@ -451,11 +452,12 @@ def load_mysql_table_stats(engine: Engine, stats: dict[str, dict[str, int | None
         table_name = row.get("table_name")
         if table_name in stats:
             stats[table_name]["row_count"] = optional_int(row.get("row_count"))
+            stats[table_name]["row_count_estimated"] = True
             stats[table_name]["size_bytes"] = optional_int(row.get("size_bytes"))
     return stats
 
 
-def load_postgresql_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+def load_postgresql_table_stats(engine: Engine, stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     sql = """
         select
           c.relname as table_name,
@@ -472,11 +474,12 @@ def load_postgresql_table_stats(engine: Engine, stats: dict[str, dict[str, int |
         table_name = row.get("table_name")
         if table_name in stats:
             stats[table_name]["row_count"] = optional_int(row.get("row_count"))
+            stats[table_name]["row_count_estimated"] = True
             stats[table_name]["size_bytes"] = optional_int(row.get("size_bytes"))
     return stats
 
 
-def load_clickhouse_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+def load_clickhouse_table_stats(engine: Engine, stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     sql = """
         select
           name as table_name,
@@ -495,7 +498,7 @@ def load_clickhouse_table_stats(engine: Engine, stats: dict[str, dict[str, int |
     return stats
 
 
-def load_sqlite_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+def load_sqlite_table_stats(engine: Engine, stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     with engine.connect() as connection:
         for table_name in stats:
             try:

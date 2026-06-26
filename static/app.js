@@ -28,18 +28,23 @@ const state = {
   virtualRenderFrame: 0,
   aiConfig: null,
   aiSessionId: sessionStorage.getItem("sqlRedisVisualAiSessionId") || null,
+  aiSessionByConnection: {},
   aiConnectionId: null,
   aiMessages: [],
   aiBusy: false,
   aiLastSql: "",
   aiModelId: sessionStorage.getItem("sqlRedisVisualAiModelId") || null,
+  aiPanelCollapsed: localStorage.getItem("sqlRedisVisualAiPanelCollapsed") === "1",
 };
 
 const STORAGE_KEY = "sqlRedisVisualConnections";
 const SIDEBAR_WIDTH_KEY = "sqlRedisVisualSidebarWidth";
 const COLUMN_WIDTHS_KEY = "sqlRedisVisualColumnWidths";
 const AI_SESSION_KEY = "sqlRedisVisualAiSessionId";
+const AI_SESSION_BY_CONNECTION_KEY = "sqlRedisVisualAiSessionByConnection";
 const AI_MODEL_KEY = "sqlRedisVisualAiModelId";
+const AI_PANEL_WIDTH_KEY = "sqlRedisVisualAiPanelWidth";
+const AI_PANEL_COLLAPSED_KEY = "sqlRedisVisualAiPanelCollapsed";
 const DEFAULT_REDIS_URL = "redis://localhost:6379/0";
 const TABLE_ROW_LIMIT = 100;
 const QUERY_ROW_LIMIT = 100;
@@ -48,12 +53,16 @@ const VIRTUAL_OVERSCAN_ROWS = 10;
 const VIRTUAL_BOTTOM_PADDING = 72;
 const LOAD_MORE_BOTTOM_THRESHOLD = 12;
 
+state.aiSessionByConnection = loadAiSessionMap();
+
 const els = {
   sqlStatus: document.querySelector("#sqlStatus"),
   redisStatus: document.querySelector("#redisStatus"),
   sqlStatusLabel: document.querySelector("#sqlStatusLabel"),
   redisStatusLabel: document.querySelector("#redisStatusLabel"),
   sidebarResizeHandle: document.querySelector("#sidebarResizeHandle"),
+  aiResizeHandle: document.querySelector("#aiResizeHandle"),
+  aiOpenButton: document.querySelector("#aiOpenButton"),
   newConnectionButton: document.querySelector("#newConnectionButton"),
   connectionModal: document.querySelector("#connectionModal"),
   connectionModalTitle: document.querySelector("#connectionModalTitle"),
@@ -99,6 +108,7 @@ const els = {
   thead: document.querySelector("#dataTable thead"),
   tbody: document.querySelector("#dataTable tbody"),
   aiConfigStatus: document.querySelector("#aiConfigStatus"),
+  aiBackendBadge: document.querySelector("#aiBackendBadge"),
   aiModelSelect: document.querySelector("#aiModelSelect"),
   aiConnectionSelect: document.querySelector("#aiConnectionSelect"),
   aiMessageList: document.querySelector("#aiMessageList"),
@@ -109,6 +119,7 @@ const els = {
   aiPrompt: document.querySelector("#aiPrompt"),
   aiSendButton: document.querySelector("#aiSendButton"),
   aiResetButton: document.querySelector("#aiResetButton"),
+  aiCloseButton: document.querySelector("#aiCloseButton"),
 };
 
 async function api(path, options = {}) {
@@ -162,6 +173,47 @@ function selectedAiConnection() {
   return connectionById(state.aiConnectionId) || activeConnection() || aiEligibleConnections()[0] || null;
 }
 
+function loadAiSessionMap() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(AI_SESSION_BY_CONNECTION_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAiSessionMap() {
+  sessionStorage.setItem(AI_SESSION_BY_CONNECTION_KEY, JSON.stringify(state.aiSessionByConnection));
+}
+
+function rememberCurrentAiSession() {
+  if (!state.aiConnectionId || !state.aiSessionId) return;
+  state.aiSessionByConnection[state.aiConnectionId] = state.aiSessionId;
+  saveAiSessionMap();
+}
+
+function rememberLegacyAiSession() {
+  if (!state.aiConnectionId || !state.aiSessionId) return;
+  if (state.aiSessionByConnection[state.aiConnectionId]) return;
+  state.aiSessionByConnection[state.aiConnectionId] = state.aiSessionId;
+  saveAiSessionMap();
+}
+
+function forgetAiSessionForConnection(connectionId) {
+  if (!connectionId) return;
+  delete state.aiSessionByConnection[connectionId];
+  saveAiSessionMap();
+}
+
+function setCurrentAiSession(sessionId) {
+  state.aiSessionId = sessionId || null;
+  if (state.aiSessionId) {
+    sessionStorage.setItem(AI_SESSION_KEY, state.aiSessionId);
+  } else {
+    sessionStorage.removeItem(AI_SESSION_KEY);
+  }
+}
+
 function renderAiConnectionOptions() {
   const previous = state.aiConnectionId;
   const options = aiEligibleConnections();
@@ -183,11 +235,14 @@ function renderAiConnectionOptions() {
     const active = activeConnection();
     const preferredId = previous && options.some((connection) => connection.id === previous)
       ? previous
-      : active && options.some((connection) => connection.id === active.id)
+      : !state.aiSessionId && active && options.some((connection) => connection.id === active.id)
         ? active.id
         : options[0].id;
     state.aiConnectionId = preferredId;
     els.aiConnectionSelect.value = preferredId;
+    if (!state.aiSessionId && state.aiSessionByConnection[preferredId]) {
+      setCurrentAiSession(state.aiSessionByConnection[preferredId]);
+    }
   }
 
   updateAiControls();
@@ -230,19 +285,239 @@ function selectedAiModel() {
   return models.find((model) => model.id === state.aiModelId) || models[0] || null;
 }
 
+function aiBackendLabel() {
+  if (!state.aiConfig) return "检测中";
+  return state.aiConfig?.agent_backend === "opencode" ? "OpenCode 模式" : "直连模式";
+}
+
 function updateAiControls() {
   const configured = Boolean(state.aiConfig?.configured);
   const hasModel = Boolean(selectedAiModel());
   const hasConnection = Boolean(selectedAiConnection());
+  const backendLabel = aiBackendLabel();
   els.aiSendButton.disabled = state.aiBusy || !configured || !hasModel || !hasConnection;
   els.aiPrompt.disabled = state.aiBusy || !configured || !hasModel || !hasConnection;
   els.aiModelSelect.disabled = state.aiBusy || !configured || (state.aiConfig?.models || []).length === 0;
   els.aiConnectionSelect.disabled = state.aiBusy || aiEligibleConnections().length === 0;
   els.aiResetButton.disabled = state.aiBusy;
-  els.aiConfigStatus.textContent = configured
-    ? `已配置 ${(state.aiConfig.models || []).length} 个模型`
+  els.aiBackendBadge.textContent = backendLabel;
+  els.aiBackendBadge.classList.toggle("opencode", state.aiConfig?.agent_backend === "opencode");
+  els.aiBackendBadge.classList.toggle("direct", Boolean(state.aiConfig) && state.aiConfig?.agent_backend !== "opencode");
+  els.aiBackendBadge.classList.toggle("pending", !state.aiConfig);
+  els.aiBackendBadge.title = state.aiConfig?.agent_backend === "opencode"
+    ? "通过 OpenCode 后端 agent 执行"
+    : state.aiConfig
+      ? "由后端直接调用模型接口"
+      : "正在读取 AI 后端模式";
+  els.aiConfigStatus.textContent = !state.aiConfig
+    ? "检查配置中..."
+    : configured
+    ? `${backendLabel}，已配置 ${(state.aiConfig.models || []).length} 个模型`
     : "未配置 AI_MODELS 或 AI_API_BASE / AI_API_KEY / AI_MODEL";
   els.aiConfigStatus.classList.toggle("error", state.aiConfig && !configured);
+}
+
+function renderMarkdown(text) {
+  const fragment = document.createDocumentFragment();
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fenceMatch = line.match(/^\s*```([A-Za-z0-9_-]*)\s*$/);
+    if (fenceMatch) {
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !lines[index].match(/^\s*```\s*$/)) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (fenceMatch[1]) code.className = `language-${fenceMatch[1]}`;
+      code.textContent = codeLines.join("\n");
+      pre.appendChild(code);
+      fragment.appendChild(pre);
+      continue;
+    }
+
+    if (isMarkdownTable(lines, index)) {
+      const { element, nextIndex } = renderMarkdownTable(lines, index);
+      fragment.appendChild(element);
+      index = nextIndex;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      const heading = document.createElement(`h${Math.min(headingMatch[1].length, 4)}`);
+      appendInlineMarkdown(heading, headingMatch[2].trim());
+      fragment.appendChild(heading);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) {
+      fragment.appendChild(document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quoteLines = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      const blockquote = document.createElement("blockquote");
+      const paragraph = document.createElement("p");
+      appendInlineMarkdown(paragraph, quoteLines.join("\n"));
+      blockquote.appendChild(paragraph);
+      fragment.appendChild(blockquote);
+      continue;
+    }
+
+    const listMatch = line.match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/);
+    if (listMatch) {
+      const ordered = /\d+\./.test(listMatch[2]);
+      const list = document.createElement(ordered ? "ol" : "ul");
+      while (index < lines.length) {
+        const itemMatch = lines[index].match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/);
+        if (!itemMatch || /\d+\./.test(itemMatch[2]) !== ordered) break;
+        const item = document.createElement("li");
+        appendInlineMarkdown(item, itemMatch[3].trim());
+        list.appendChild(item);
+        index += 1;
+      }
+      fragment.appendChild(list);
+      continue;
+    }
+
+    const paragraphLines = [];
+    while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines, index)) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    const paragraph = document.createElement("p");
+    appendInlineMarkdown(paragraph, paragraphLines.join("\n"));
+    fragment.appendChild(paragraph);
+  }
+
+  return fragment;
+}
+
+function isMarkdownBlockStart(lines, index) {
+  const line = lines[index] || "";
+  return /^\s*```/.test(line)
+    || /^(#{1,4})\s+/.test(line)
+    || /^\s*(-{3,}|\*{3,})\s*$/.test(line)
+    || /^\s*>\s?/.test(line)
+    || /^(\s*)([-*+]|\d+\.)\s+/.test(line)
+    || isMarkdownTable(lines, index);
+}
+
+function appendInlineMarkdown(parent, text) {
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\((https?:\/\/[^\s)]+)\))/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    appendTextWithBreaks(parent, text.slice(cursor, match.index));
+    const token = match[0];
+    if (token.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = token.slice(1, -1);
+      parent.appendChild(code);
+    } else if (token.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = token.slice(2, -2);
+      parent.appendChild(strong);
+    } else if (token.startsWith("*")) {
+      const emphasis = document.createElement("em");
+      emphasis.textContent = token.slice(1, -1);
+      parent.appendChild(emphasis);
+    } else {
+      const linkMatch = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      if (linkMatch) {
+        const link = document.createElement("a");
+        link.href = linkMatch[2];
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = linkMatch[1];
+        parent.appendChild(link);
+      } else {
+        appendTextWithBreaks(parent, token);
+      }
+    }
+    cursor = Number(match.index) + token.length;
+  }
+  appendTextWithBreaks(parent, text.slice(cursor));
+}
+
+function appendTextWithBreaks(parent, text) {
+  const parts = String(text || "").split("\n");
+  parts.forEach((part, index) => {
+    if (index > 0) parent.appendChild(document.createElement("br"));
+    if (part) parent.appendChild(document.createTextNode(part));
+  });
+}
+
+function isMarkdownTable(lines, index) {
+  return isMarkdownTableRow(lines[index]) && isMarkdownTableSeparator(lines[index + 1]);
+}
+
+function isMarkdownTableRow(line = "") {
+  return line.includes("|") && line.split("|").filter((cell) => cell.trim()).length >= 2;
+}
+
+function isMarkdownTableSeparator(line = "") {
+  const cells = markdownTableCells(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function markdownTableCells(line = "") {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdownTable(lines, index) {
+  const headers = markdownTableCells(lines[index]);
+  index += 2;
+  const rows = [];
+  while (index < lines.length && isMarkdownTableRow(lines[index]) && !isMarkdownTableSeparator(lines[index])) {
+    rows.push(markdownTableCells(lines[index]));
+    index += 1;
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "markdown-table-wrap";
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  headers.forEach((header) => {
+    const th = document.createElement("th");
+    appendInlineMarkdown(th, header);
+    headerRow.appendChild(th);
+  });
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    headers.forEach((_, cellIndex) => {
+      const td = document.createElement("td");
+      appendInlineMarkdown(td, row[cellIndex] || "");
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  return { element: wrap, nextIndex: index };
 }
 
 function renderAiMessages() {
@@ -263,7 +538,12 @@ function renderAiMessages() {
     label.textContent = message.role === "user" ? "你" : "AI";
     const content = document.createElement("div");
     content.className = "ai-message-content";
-    content.textContent = message.content || "";
+    if (message.role === "assistant") {
+      content.classList.add("markdown");
+      content.appendChild(renderMarkdown(message.content || ""));
+    } else {
+      content.textContent = message.content || "";
+    }
     item.append(label, content);
     els.aiMessageList.appendChild(item);
   });
@@ -286,6 +566,34 @@ async function loadAiConfig() {
   updateAiControls();
 }
 
+async function restoreAiSessionMessages() {
+  if (!state.aiSessionId) {
+    state.aiMessages = [];
+    renderAiMessages();
+    return;
+  }
+  try {
+    const data = await api(`/api/ai/sessions/${encodeURIComponent(state.aiSessionId)}/messages`);
+    state.aiMessages = Array.isArray(data.messages) ? data.messages : [];
+    renderAiMessages();
+  } catch (error) {
+    forgetAiSessionForConnection(state.aiConnectionId);
+    setCurrentAiSession(null);
+    state.aiMessages = [];
+    renderAiMessages();
+  }
+}
+
+async function switchAiConnection(connectionId) {
+  rememberCurrentAiSession();
+  state.aiConnectionId = connectionId || null;
+  const sessionId = state.aiConnectionId ? state.aiSessionByConnection[state.aiConnectionId] : null;
+  setCurrentAiSession(sessionId || null);
+  showAiSql("");
+  await restoreAiSessionMessages();
+  updateAiControls();
+}
+
 async function ensureAiSession() {
   const connection = selectedAiConnection();
   if (!connection) {
@@ -301,14 +609,17 @@ async function ensureAiSession() {
       connection_name: connection.name,
     }),
   });
-  state.aiSessionId = data.session_id;
-  sessionStorage.setItem(AI_SESSION_KEY, state.aiSessionId);
+  setCurrentAiSession(data.session_id);
+  if (state.aiConnectionId) {
+    state.aiSessionByConnection[state.aiConnectionId] = state.aiSessionId;
+    saveAiSessionMap();
+  }
   return state.aiSessionId;
 }
 
 function resetAiSession({ keepMessages = false } = {}) {
-  state.aiSessionId = null;
-  sessionStorage.removeItem(AI_SESSION_KEY);
+  forgetAiSessionForConnection(state.aiConnectionId);
+  setCurrentAiSession(null);
   showAiSql("");
   if (!keepMessages) {
     state.aiMessages = [];
@@ -458,6 +769,48 @@ function setupSidebarResize() {
     startX = event.clientX;
     startWidth = Number(getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width").replace("px", "")) || 280;
     document.body.classList.add("resizing");
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  });
+}
+
+function setAiPanelWidth(width) {
+  const nextWidth = Math.max(280, Math.min(680, width));
+  document.documentElement.style.setProperty("--ai-panel-width", `${nextWidth}px`);
+  localStorage.setItem(AI_PANEL_WIDTH_KEY, String(nextWidth));
+}
+
+function setAiPanelCollapsed(collapsed) {
+  state.aiPanelCollapsed = Boolean(collapsed);
+  document.body.classList.toggle("ai-panel-collapsed", state.aiPanelCollapsed);
+  els.aiOpenButton.classList.toggle("hidden", !state.aiPanelCollapsed);
+  localStorage.setItem(AI_PANEL_COLLAPSED_KEY, state.aiPanelCollapsed ? "1" : "0");
+}
+
+function setupAiPanelResize() {
+  const savedWidth = Number(localStorage.getItem(AI_PANEL_WIDTH_KEY));
+  if (savedWidth) {
+    setAiPanelWidth(savedWidth);
+  }
+  setAiPanelCollapsed(state.aiPanelCollapsed);
+
+  let startX = 0;
+  let startWidth = 0;
+
+  function onMove(event) {
+    setAiPanelWidth(startWidth + startX - event.clientX);
+  }
+
+  function onUp() {
+    document.body.classList.remove("resizing-ai");
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+  }
+
+  els.aiResizeHandle.addEventListener("mousedown", (event) => {
+    startX = event.clientX;
+    startWidth = Number(getComputedStyle(document.documentElement).getPropertyValue("--ai-panel-width").replace("px", "")) || 360;
+    document.body.classList.add("resizing-ai");
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   });
@@ -1017,6 +1370,14 @@ async function confirmDeleteConnection() {
 }
 
 async function deleteConnection(id) {
+  if (state.aiConnectionId === id) {
+    setCurrentAiSession(null);
+    state.aiConnectionId = null;
+    state.aiMessages = [];
+    showAiSql("");
+    renderAiMessages();
+  }
+  forgetAiSessionForConnection(id);
   state.connections = state.connections.filter((connection) => connection.id !== id);
   state.tabs = state.tabs.filter((tab) => tab.connectionId !== id);
   if (state.activeConnectionId === id) {
@@ -1183,7 +1544,7 @@ function renderTableItem(connection, table) {
 function tableStatsLabel(table) {
   const parts = [];
   if (Number.isFinite(Number(table.row_count))) {
-    parts.push(`${formatCount(table.row_count)}行`);
+    parts.push(`${tableRowCountPrefix(table)}${formatCount(table.row_count)}行`);
   }
   if (Number.isFinite(Number(table.size_bytes))) {
     parts.push(formatBytes(table.size_bytes));
@@ -1194,12 +1555,30 @@ function tableStatsLabel(table) {
 function tableStatsTitle(table) {
   const parts = [table.name];
   if (Number.isFinite(Number(table.row_count))) {
-    parts.push(`${Number(table.row_count).toLocaleString("zh-CN")} 行`);
+    parts.push(`${tableRowCountPrefix(table)}${Number(table.row_count).toLocaleString("zh-CN")} 行`);
   }
   if (Number.isFinite(Number(table.size_bytes))) {
     parts.push(formatBytes(table.size_bytes));
   }
   return parts.join(" · ");
+}
+
+function tableRowCountPrefix(table) {
+  if (table.row_count_lower_bound) return "至少";
+  if (table.row_count_estimated) return "约";
+  return "";
+}
+
+function syncTableLoadedCount(table, loadedCount) {
+  if (!table || !Number.isFinite(Number(loadedCount))) return;
+  const loaded = Number(loadedCount);
+  const displayed = Number(table.row_count);
+  if (!Number.isFinite(displayed) || loaded > displayed) {
+    table.row_count = loaded;
+    table.row_count_estimated = false;
+    table.row_count_lower_bound = true;
+    renderConnections();
+  }
 }
 
 function formatCount(value) {
@@ -1338,11 +1717,12 @@ async function loadRows({ append = false } = {}) {
       els.tableWrap.scrollTop = 0;
       renderGrid(columns, state.activeRows, !isReadOnlyActive(), { virtual: true });
     }
+    syncTableLoadedCount(state.activeTable, state.activeRealRowsLoaded);
     setMessage(rowLoadMessage());
   } catch (error) {
     setMessage(error.message, true);
   } finally {
-    state.isLoadingRows = false;
+    finishRowsLoading();
   }
 }
 
@@ -1388,6 +1768,15 @@ function hasMoreRows(data) {
     return Number(data.loaded || 0) < state.activeRowsTotal;
   }
   return Array.isArray(data.rows) && data.rows.length >= TABLE_ROW_LIMIT;
+}
+
+function finishRowsLoading() {
+  state.isLoadingRows = false;
+  if (state.gridVirtual) {
+    renderVisibleRows({ force: true });
+  } else if (state.gridColumns.length > 0) {
+    renderAllRows();
+  }
 }
 
 async function loadQueryRows({ append = false } = {}) {
@@ -1439,6 +1828,7 @@ async function loadQueryRows({ append = false } = {}) {
       }
       els.viewTitle.textContent = `浏览数据 ${tableForQuery.name}`;
       els.viewMeta.textContent = isReadOnlyActive() ? "当前为 SQL 筛选结果，只读连接" : "当前为 SQL 筛选结果，可选择和编辑";
+      syncTableLoadedCount(tableForQuery, state.activeRealRowsLoaded);
     } else {
       state.queryMode = true;
       state.activeTabId = null;
@@ -1460,7 +1850,7 @@ async function loadQueryRows({ append = false } = {}) {
   } catch (error) {
     setMessage(error.message, true);
   } finally {
-    state.isLoadingRows = false;
+    finishRowsLoading();
   }
 }
 
@@ -1669,6 +2059,18 @@ function createLoadMoreRow() {
   return tr;
 }
 
+function formatCellValue(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 function createRowElement(columns, row, editable, rowIndex) {
   const tr = document.createElement("tr");
   tr.dataset.rowIndex = String(rowIndex);
@@ -1696,7 +2098,7 @@ function createRowElement(columns, row, editable, rowIndex) {
     const td = document.createElement("td");
     const pendingChange = pendingChangeForCell(row, column);
     const rawValue = pendingChange ? pendingChange.value : row[column];
-    td.textContent = rawValue === null || rawValue === undefined ? "" : String(rawValue);
+    td.textContent = formatCellValue(rawValue);
     td.title = td.textContent;
 
     if (editable && canEditCell(row, column)) {
@@ -2044,6 +2446,8 @@ els.confirmDeleteButton.addEventListener("click", confirmDeleteConnection);
 els.aiForm.addEventListener("submit", submitAiMessage);
 els.aiUseSqlButton.addEventListener("click", useAiSqlInEditor);
 els.aiResetButton.addEventListener("click", () => resetAiSession());
+els.aiCloseButton.addEventListener("click", () => setAiPanelCollapsed(true));
+els.aiOpenButton.addEventListener("click", () => setAiPanelCollapsed(false));
 els.aiModelSelect.addEventListener("change", () => {
   state.aiModelId = els.aiModelSelect.value || null;
   if (state.aiModelId) {
@@ -2054,9 +2458,7 @@ els.aiModelSelect.addEventListener("change", () => {
   updateAiControls();
 });
 els.aiConnectionSelect.addEventListener("change", () => {
-  state.aiConnectionId = els.aiConnectionSelect.value || null;
-  resetAiSession();
-  updateAiControls();
+  switchAiConnection(els.aiConnectionSelect.value || null);
 });
 els.connectionModal.addEventListener("click", (event) => {
   if (event.target === els.connectionModal) {
@@ -2074,6 +2476,7 @@ document.querySelectorAll('input[name="connectionMode"]').forEach((input) => {
 
 async function start() {
   setupSidebarResize();
+  setupAiPanelResize();
   state.connections = loadStoredConnections();
   els.redisUrl.value = DEFAULT_REDIS_URL;
   setRedisEnabled(false);
@@ -2086,6 +2489,8 @@ async function start() {
   setMessage("添加或点击左侧连接后开始浏览数据");
   renderAiMessages();
   await loadAiConfig();
+  rememberLegacyAiSession();
+  await restoreAiSessionMessages();
 }
 
 [

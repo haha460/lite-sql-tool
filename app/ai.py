@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,12 +29,16 @@ if load_dotenv:
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
 SELECT_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 DEFAULT_AI_LIMIT = 100
 MAX_AI_LIMIT = 1000
 MAX_SCHEMA_TABLES = 80
 MAX_RESULT_CHARS = 14000
 MAX_HISTORY_MESSAGES = 12
+OPENCODE_POLL_INTERVAL_SECONDS = 0.8
+OPENCODE_TRANSIENT_ERROR_GRACE_SECONDS = 20
+AI_SESSION_TABLE = "ai_sessions"
 
 
 class ConnectionInfo(BaseModel):
@@ -67,12 +74,14 @@ class AiSession:
     id: str
     connection: ConnectionInfo
     connection_name: str | None
+    opencode_session_id: str | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: utc_now())
     updated_at: str = field(default_factory=lambda: utc_now())
 
 
 AI_SESSIONS: dict[str, AiSession] = {}
+AI_SESSION_STORE_READY = False
 
 
 @router.get("/config")
@@ -83,6 +92,7 @@ def ai_config() -> dict[str, Any]:
         "configured": config["configured"],
         "model": default_model["model"] if default_model else "",
         "api_base": default_model["api_base"] if default_model else "",
+        "agent_backend": agent_backend(),
         "default_model_id": default_model["id"] if default_model else None,
         "models": public_model_configs(config["models"]),
     }
@@ -91,13 +101,14 @@ def ai_config() -> dict[str, Any]:
 @router.post("/sessions")
 def create_ai_session(payload: AiSessionRequest) -> dict[str, Any]:
     ensure_sql_enabled(payload.connection)
+    init_session_store()
     session_id = uuid.uuid4().hex
     session = AiSession(
         id=session_id,
         connection=payload.connection,
         connection_name=payload.connection_name,
     )
-    AI_SESSIONS[session_id] = session
+    save_session(session)
     return {
         "session_id": session_id,
         "created_at": session.created_at,
@@ -108,7 +119,14 @@ def create_ai_session(payload: AiSessionRequest) -> dict[str, Any]:
 @router.get("/sessions/{session_id}/messages")
 def get_ai_messages(session_id: str) -> dict[str, Any]:
     session = require_session(session_id)
-    return {"messages": session.messages}
+    return {
+        "session_id": session.id,
+        "messages": session.messages,
+        "connection_name": session.connection_name,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+        "opencode_session_id": session.opencode_session_id,
+    }
 
 
 @router.post("/chat")
@@ -119,9 +137,24 @@ async def ai_chat(payload: AiChatRequest) -> dict[str, Any]:
     model_config = get_model_config(payload.model_id)
 
     user_message = payload.message.strip()
+    if agent_backend() == "opencode":
+        assistant_message = await chat_with_opencode(session, user_message, model_config)
+        return {"message": assistant_message, "session_id": session.id}
+
+    assistant_message = await chat_with_direct_model(session, user_message, payload.limit, model_config)
+    return {"message": assistant_message, "session_id": session.id}
+
+
+async def chat_with_direct_model(
+    session: AiSession,
+    user_message: str,
+    limit: int,
+    model_config: dict[str, str],
+) -> dict[str, Any]:
     schema = load_schema(session.connection)
     session.messages.append({"role": "user", "content": user_message, "created_at": utc_now()})
     session.updated_at = utc_now()
+    save_session(session)
 
     draft = await call_ai_model(
         [
@@ -138,7 +171,7 @@ async def ai_chat(payload: AiChatRequest) -> dict[str, Any]:
 
     if sql:
         try:
-            executed = execute_readonly_sql(session.connection, sql, payload.limit)
+            executed = execute_readonly_sql(session.connection, sql, limit)
             summary = await call_ai_model(
                 [
                     {"role": "system", "content": build_result_summary_prompt()},
@@ -177,7 +210,8 @@ async def ai_chat(payload: AiChatRequest) -> dict[str, Any]:
     session.messages.append(assistant_message)
     session.updated_at = utc_now()
     trim_session_messages(session)
-    return {"message": assistant_message, "session_id": session.id}
+    save_session(session)
+    return assistant_message
 
 
 @router.post("/tool/schema")
@@ -312,6 +346,267 @@ def get_model_config(model_id: str | None) -> dict[str, str]:
 def ensure_ai_configured() -> None:
     if not load_ai_config()["configured"]:
         raise HTTPException(status_code=400, detail="AI is not configured. Set AI_MODELS or AI_API_BASE, AI_API_KEY and AI_MODEL.")
+
+
+def agent_backend() -> str:
+    backend = os.getenv("AI_AGENT_BACKEND", "direct").strip().lower()
+    return "opencode" if backend == "opencode" else "direct"
+
+
+async def chat_with_opencode(
+    session: AiSession,
+    user_message: str,
+    model_config: dict[str, str],
+) -> dict[str, Any]:
+    session.messages.append({"role": "user", "content": user_message, "created_at": utc_now()})
+    session.updated_at = utc_now()
+    save_session(session)
+    opencode_session_id = await ensure_opencode_session(session)
+    prompt = build_opencode_prompt(session.id, user_message)
+    await send_opencode_message(opencode_session_id, prompt, model_config)
+    response_data = await wait_for_opencode_response(opencode_session_id)
+    answer = extract_latest_opencode_assistant_text(response_data)
+    assistant_message = {
+        "role": "assistant",
+        "content": answer or "OpenCode did not return a text response.",
+        "model_id": model_config["id"],
+        "model": model_config["model"],
+        "sql": None,
+        "result": None,
+        "agent_backend": "opencode",
+        "created_at": utc_now(),
+    }
+    session.messages.append(assistant_message)
+    session.updated_at = utc_now()
+    trim_session_messages(session)
+    save_session(session)
+    return assistant_message
+
+
+async def ensure_opencode_session(session: AiSession) -> str:
+    if session.opencode_session_id:
+        return session.opencode_session_id
+
+    model_config = get_model_config(None)
+    data = await opencode_request(
+        "POST",
+        "/session",
+        json_payload={
+            "title": session.connection_name or "Database analysis",
+            "agent": os.getenv("OPENCODE_AGENT", "db-analyst"),
+            "model": opencode_model_object(model_config),
+        },
+    )
+    session_id = extract_opencode_session_id(data)
+    if not session_id:
+        raise HTTPException(status_code=502, detail="OpenCode did not return a session id")
+    session.opencode_session_id = session_id
+    session.updated_at = utc_now()
+    save_session(session)
+    return session_id
+
+
+async def send_opencode_message(
+    opencode_session_id: str,
+    prompt: str,
+    model_config: dict[str, str],
+) -> dict[str, Any]:
+    return await opencode_request(
+        "POST",
+        f"/session/{opencode_session_id}/message",
+        json_payload={
+            "agent": os.getenv("OPENCODE_AGENT", "db-analyst"),
+            "model": opencode_prompt_model_object(model_config),
+            "parts": [{"type": "text", "text": prompt}],
+        },
+    )
+
+
+async def load_opencode_messages(opencode_session_id: str) -> dict[str, Any]:
+    return await opencode_request("GET", f"/session/{opencode_session_id}/message", json_payload={})
+
+
+async def wait_for_opencode_response(opencode_session_id: str) -> dict[str, Any]:
+    timeout = float(os.getenv("OPENCODE_TIMEOUT", "120"))
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_data: dict[str, Any] = {}
+    last_error: HTTPException | None = None
+    first_error_at: float | None = None
+
+    while True:
+        now = asyncio.get_running_loop().time()
+        try:
+            last_data = await load_opencode_messages(opencode_session_id)
+            last_error = None
+            first_error_at = None
+        except HTTPException as exc:
+            last_error = exc
+            if first_error_at is None:
+                first_error_at = now
+            if now >= deadline or now - first_error_at >= OPENCODE_TRANSIENT_ERROR_GRACE_SECONDS:
+                raise exc
+            await asyncio.sleep(OPENCODE_POLL_INTERVAL_SECONDS)
+            continue
+        if has_completed_opencode_assistant_message(last_data):
+            return last_data
+        if now >= deadline:
+            if last_error:
+                raise last_error
+            raise HTTPException(status_code=502, detail=f"OpenCode response timed out after {int(timeout)} seconds")
+        await asyncio.sleep(OPENCODE_POLL_INTERVAL_SECONDS)
+
+
+async def opencode_request(method: str, path: str, json_payload: dict[str, Any]) -> dict[str, Any]:
+    base_url = os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:4096").rstrip("/")
+    timeout = float(os.getenv("OPENCODE_TIMEOUT", "120"))
+    headers = {"Content-Type": "application/json"}
+    username = os.getenv("OPENCODE_SERVER_USERNAME", "")
+    password = os.getenv("OPENCODE_SERVER_PASSWORD", "")
+    auth = (username, password) if username or password else None
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, auth=auth) as client:
+            response = await client.request(
+                method,
+                f"{base_url}{path}",
+                headers=headers,
+                params=opencode_location_params(),
+                json=json_payload if method.upper() != "GET" else None,
+            )
+            response.raise_for_status()
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=502, detail=f"OpenCode server is not reachable at {base_url}") from exc
+    except httpx.HTTPStatusError as exc:
+        detail = safe_response_detail(exc.response)
+        raise HTTPException(status_code=502, detail=f"OpenCode request failed: {detail}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"OpenCode request failed: {exc}") from exc
+
+    if not response.content:
+        return {}
+    try:
+        data = response.json()
+    except ValueError:
+        return {"text": response.text}
+    return data if isinstance(data, dict) else {"data": data}
+
+
+def build_opencode_prompt(app_session_id: str, user_message: str) -> str:
+    return (
+        f"app_session_id: {app_session_id}\n\n"
+        "请使用 db_schema 和 db_select 工具完成数据库分析。"
+        "只能执行 SELECT/WITH 查询。\n\n"
+        f"用户问题：\n{user_message}"
+    )
+
+
+def opencode_location_params() -> dict[str, str]:
+    return {"directory": os.getenv("OPENCODE_DIRECTORY", str(ROOT_DIR))}
+
+
+def opencode_provider_id() -> str:
+    return os.getenv("OPENCODE_PROVIDER", "huayan").strip() or "huayan"
+
+
+def opencode_model_object(model_config: dict[str, str]) -> dict[str, str]:
+    return {
+        "id": model_config["model"],
+        "providerID": opencode_provider_id(),
+    }
+
+
+def opencode_prompt_model_object(model_config: dict[str, str]) -> dict[str, str]:
+    return {
+        "providerID": opencode_provider_id(),
+        "modelID": model_config["model"],
+    }
+
+
+def opencode_model_name(model_config: dict[str, str]) -> str:
+    provider = os.getenv("OPENCODE_PROVIDER", "huayan").strip() or "huayan"
+    return f"{provider}/{model_config['model']}"
+
+
+def extract_opencode_session_id(data: dict[str, Any]) -> str | None:
+    for key in ("id", "sessionID", "session_id", "sessionId"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    session = data.get("session")
+    if isinstance(session, dict):
+        return extract_opencode_session_id(session)
+    return None
+
+
+def extract_opencode_text(data: Any) -> str:
+    if isinstance(data, str):
+        return data
+    if isinstance(data, list):
+        return "\n".join(filter(None, (extract_opencode_text(item) for item in data))).strip()
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("text", "content", "message", "output", "response"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (dict, list)):
+            nested = extract_opencode_text(value)
+            if nested:
+                return nested
+
+    parts = data.get("parts")
+    if isinstance(parts, list):
+        nested = extract_opencode_text(parts)
+        if nested:
+            return nested
+
+    return ""
+
+
+def extract_latest_opencode_assistant_text(data: Any) -> str:
+    messages = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(messages, list):
+        return extract_opencode_text(data)
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info") if isinstance(message.get("info"), dict) else {}
+        if info.get("role") != "assistant":
+            continue
+        error = info.get("error")
+        if isinstance(error, dict):
+            detail = error.get("data")
+            if isinstance(detail, dict) and detail.get("message"):
+                return f"OpenCode 执行失败：{detail['message']}"
+            if error.get("name"):
+                return f"OpenCode 执行失败：{error['name']}"
+        text = extract_opencode_text(message.get("parts", []))
+        if text:
+            return text
+    return ""
+
+
+def has_completed_opencode_assistant_message(data: Any) -> bool:
+    messages = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(messages, list):
+        return bool(extract_opencode_text(data))
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info") if isinstance(message.get("info"), dict) else {}
+        if info.get("role") != "assistant":
+            continue
+        if info.get("error"):
+            return True
+        finish = info.get("finish")
+        if finish == "tool-calls":
+            continue
+        time_info = info.get("time") if isinstance(info.get("time"), dict) else {}
+        return bool(time_info.get("completed"))
+    return False
 
 
 async def call_ai_model(messages: list[dict[str, str]], model_config: dict[str, str]) -> str:
@@ -533,8 +828,175 @@ def trim_session_messages(session: AiSession) -> None:
 def require_session(session_id: str) -> AiSession:
     session = AI_SESSIONS.get(session_id)
     if not session:
+        session = load_session(session_id)
+    if not session:
         raise HTTPException(status_code=404, detail="AI session not found")
     return session
+
+
+def session_store_url() -> str:
+    return os.getenv("AI_SESSION_DATABASE_URL", "").strip()
+
+
+def session_store_enabled() -> bool:
+    return bool(session_store_url())
+
+
+@lru_cache(maxsize=1)
+def get_session_store_engine() -> Any:
+    url = session_store_url()
+    if not url:
+        raise RuntimeError("AI_SESSION_DATABASE_URL is not configured")
+    return create_sql_engine(url)
+
+
+def init_session_store() -> None:
+    global AI_SESSION_STORE_READY
+    if AI_SESSION_STORE_READY or not session_store_enabled():
+        return
+
+    engine = get_session_store_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"""
+                    create table if not exists {AI_SESSION_TABLE} (
+                        id text primary key,
+                        connection json not null,
+                        connection_name text,
+                        opencode_session_id text,
+                        messages json not null default '[]',
+                        created_at text not null,
+                        updated_at text not null
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    f"""
+                    create index if not exists {AI_SESSION_TABLE}_updated_at_idx
+                    on {AI_SESSION_TABLE} (updated_at)
+                    """
+                )
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize AI session store: {exc}") from exc
+
+    AI_SESSION_STORE_READY = True
+
+
+def save_session(session: AiSession) -> None:
+    AI_SESSIONS[session.id] = session
+    if not session_store_enabled():
+        return
+    init_session_store()
+    engine = get_session_store_engine()
+    payload = {
+        "id": session.id,
+        "connection": json.dumps(session.connection.model_dump(), ensure_ascii=False),
+        "connection_name": session.connection_name,
+        "opencode_session_id": session.opencode_session_id,
+        "messages": json.dumps(session.messages, ensure_ascii=False, default=str),
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+    }
+    try:
+        with engine.begin() as connection:
+            if engine.dialect.name == "postgresql":
+                connection.execute(
+                    text(
+                        f"""
+                        insert into {AI_SESSION_TABLE}
+                            (id, connection, connection_name, opencode_session_id, messages, created_at, updated_at)
+                        values
+                            (:id, cast(:connection as json), :connection_name, :opencode_session_id,
+                             cast(:messages as json), :created_at, :updated_at)
+                        on conflict (id) do update set
+                            connection = excluded.connection,
+                            connection_name = excluded.connection_name,
+                            opencode_session_id = excluded.opencode_session_id,
+                            messages = excluded.messages,
+                            updated_at = excluded.updated_at
+                        """
+                    ),
+                    payload,
+                )
+            else:
+                connection.execute(
+                    text(
+                        f"""
+                        insert into {AI_SESSION_TABLE}
+                            (id, connection, connection_name, opencode_session_id, messages, created_at, updated_at)
+                        values
+                            (:id, :connection, :connection_name, :opencode_session_id,
+                             :messages, :created_at, :updated_at)
+                        on conflict (id) do update set
+                            connection = excluded.connection,
+                            connection_name = excluded.connection_name,
+                            opencode_session_id = excluded.opencode_session_id,
+                            messages = excluded.messages,
+                            updated_at = excluded.updated_at
+                        """
+                    ),
+                    payload,
+                )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save AI session: {exc}") from exc
+
+
+def load_session(session_id: str) -> AiSession | None:
+    if not session_store_enabled():
+        return None
+    init_session_store()
+    engine = get_session_store_engine()
+    try:
+        with engine.connect() as connection:
+            row = (
+                connection.execute(
+                    text(
+                        f"""
+                        select id, connection, connection_name, opencode_session_id,
+                               messages, created_at, updated_at
+                        from {AI_SESSION_TABLE}
+                        where id = :id
+                        """
+                    ),
+                    {"id": session_id},
+                )
+                .mappings()
+                .first()
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load AI session: {exc}") from exc
+    if not row:
+        return None
+
+    session = AiSession(
+        id=str(row["id"]),
+        connection=ConnectionInfo(**json_value(row["connection"], {})),
+        connection_name=row["connection_name"],
+        opencode_session_id=row["opencode_session_id"],
+        messages=json_value(row["messages"], []),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+    AI_SESSIONS[session.id] = session
+    return session
+
+
+def json_value(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return fallback
+    return fallback
 
 
 def ensure_sql_enabled(connection: ConnectionInfo) -> None:
