@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import MetaData, Table, delete, insert, inspect, text
 from sqlalchemy.engine import Engine
 
+from .ai import router as ai_router
 from .database import (
     DEFAULT_REDIS_URL,
     DEFAULT_SQL_URL,
@@ -85,6 +86,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(ai_router)
 
 
 @app.middleware("http")

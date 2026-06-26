@@ -42,6 +42,38 @@ mysql+pymysql://user:password@localhost:3306/app
 postgresql+psycopg://user:password@localhost:5432/app
 ```
 
+AI 助手使用 OpenAI-compatible 接口，模型服务配置只从环境变量读取。推荐使用多模型配置：
+
+```bash
+export AI_DEFAULT_MODEL="fast-model"
+export AI_MODELS='[
+  {
+    "id": "fast-model",
+    "name": "快速模型",
+    "model": "provider-fast",
+    "api_base": "https://your-provider.example.com/v1",
+    "api_key": "sk-..."
+  },
+  {
+    "id": "reasoning-model",
+    "name": "推理模型",
+    "model": "provider-reasoning",
+    "api_base": "https://your-provider.example.com/v1/chat/completions",
+    "api_key": "sk-..."
+  }
+]'
+```
+
+也兼容旧的单模型配置：
+
+```bash
+export AI_API_BASE="https://your-provider.example.com/v1"
+export AI_API_KEY="sk-..."
+export AI_MODEL="your-model-name"
+```
+
+未配置这些变量时，Web 项目仍可正常使用，右侧 AI 助手会显示未配置状态。AI 会话保存在后端内存中，页面只在 `sessionStorage` 记录当前会话 ID 和模型选择；服务重启后重新选择数据库即可。
+
 ## 启动 Web 项目
 
 一键启动：
@@ -94,6 +126,7 @@ http://127.0.0.1:8000
 - 可以点击“新增行”创建虚拟行，填写后点击“提交更新”写入数据库
 - 上方 SQL 编辑器支持 `SELECT` / `WITH` 查询
 - SQL 查询默认限制 100 行，查询结果只读，避免误更新复杂查询结果
+- 右侧 AI 助手支持选择模型和已保存 SQL 连接，通过自然语言读取表结构、生成只读 SQL、执行查询并总结结果
 
 ## API
 
@@ -108,6 +141,11 @@ POST   /api/tables/{table_name}/rows/delete
 POST   /api/query
 POST   /api/redis/keys
 POST   /api/redis/value
+GET    /api/ai/config
+POST   /api/ai/sessions
+POST   /api/ai/chat
+POST   /api/ai/tool/schema
+POST   /api/ai/tool/select
 ```
 
 ## CLI 用法

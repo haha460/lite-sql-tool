@@ -26,11 +26,20 @@ const state = {
   virtualLastRowIndex: -1,
   virtualRowCount: 0,
   virtualRenderFrame: 0,
+  aiConfig: null,
+  aiSessionId: sessionStorage.getItem("sqlRedisVisualAiSessionId") || null,
+  aiConnectionId: null,
+  aiMessages: [],
+  aiBusy: false,
+  aiLastSql: "",
+  aiModelId: sessionStorage.getItem("sqlRedisVisualAiModelId") || null,
 };
 
 const STORAGE_KEY = "sqlRedisVisualConnections";
 const SIDEBAR_WIDTH_KEY = "sqlRedisVisualSidebarWidth";
 const COLUMN_WIDTHS_KEY = "sqlRedisVisualColumnWidths";
+const AI_SESSION_KEY = "sqlRedisVisualAiSessionId";
+const AI_MODEL_KEY = "sqlRedisVisualAiModelId";
 const DEFAULT_REDIS_URL = "redis://localhost:6379/0";
 const TABLE_ROW_LIMIT = 100;
 const QUERY_ROW_LIMIT = 100;
@@ -89,6 +98,17 @@ const els = {
   table: document.querySelector("#dataTable"),
   thead: document.querySelector("#dataTable thead"),
   tbody: document.querySelector("#dataTable tbody"),
+  aiConfigStatus: document.querySelector("#aiConfigStatus"),
+  aiModelSelect: document.querySelector("#aiModelSelect"),
+  aiConnectionSelect: document.querySelector("#aiConnectionSelect"),
+  aiMessageList: document.querySelector("#aiMessageList"),
+  aiSqlCard: document.querySelector("#aiSqlCard"),
+  aiSqlText: document.querySelector("#aiSqlText"),
+  aiUseSqlButton: document.querySelector("#aiUseSqlButton"),
+  aiForm: document.querySelector("#aiForm"),
+  aiPrompt: document.querySelector("#aiPrompt"),
+  aiSendButton: document.querySelector("#aiSendButton"),
+  aiResetButton: document.querySelector("#aiResetButton"),
 };
 
 async function api(path, options = {}) {
@@ -132,6 +152,218 @@ function isRedisOnly(connection = activeConnection()) {
 function setMessage(text, isError = false) {
   els.message.textContent = text || "";
   els.message.classList.toggle("error", isError);
+}
+
+function aiEligibleConnections() {
+  return state.connections.filter((connection) => !isRedisOnly(connection) && connection.sqlUrl);
+}
+
+function selectedAiConnection() {
+  return connectionById(state.aiConnectionId) || activeConnection() || aiEligibleConnections()[0] || null;
+}
+
+function renderAiConnectionOptions() {
+  const previous = state.aiConnectionId;
+  const options = aiEligibleConnections();
+  els.aiConnectionSelect.innerHTML = "";
+
+  if (options.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "暂无 SQL 连接";
+    els.aiConnectionSelect.appendChild(option);
+    state.aiConnectionId = null;
+  } else {
+    options.forEach((connection) => {
+      const option = document.createElement("option");
+      option.value = connection.id;
+      option.textContent = connection.name;
+      els.aiConnectionSelect.appendChild(option);
+    });
+    const active = activeConnection();
+    const preferredId = previous && options.some((connection) => connection.id === previous)
+      ? previous
+      : active && options.some((connection) => connection.id === active.id)
+        ? active.id
+        : options[0].id;
+    state.aiConnectionId = preferredId;
+    els.aiConnectionSelect.value = preferredId;
+  }
+
+  updateAiControls();
+}
+
+function renderAiModelOptions() {
+  const models = state.aiConfig?.models || [];
+  els.aiModelSelect.innerHTML = "";
+
+  if (models.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "暂无模型";
+    els.aiModelSelect.appendChild(option);
+    state.aiModelId = null;
+    sessionStorage.removeItem(AI_MODEL_KEY);
+    updateAiControls();
+    return;
+  }
+
+  models.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.name || model.model || model.id;
+    option.title = `${model.model || model.id} @ ${model.api_base || ""}`;
+    els.aiModelSelect.appendChild(option);
+  });
+
+  const preferredId = state.aiModelId && models.some((model) => model.id === state.aiModelId)
+    ? state.aiModelId
+    : state.aiConfig?.default_model_id || models[0].id;
+  state.aiModelId = preferredId;
+  els.aiModelSelect.value = preferredId;
+  sessionStorage.setItem(AI_MODEL_KEY, preferredId);
+  updateAiControls();
+}
+
+function selectedAiModel() {
+  const models = state.aiConfig?.models || [];
+  return models.find((model) => model.id === state.aiModelId) || models[0] || null;
+}
+
+function updateAiControls() {
+  const configured = Boolean(state.aiConfig?.configured);
+  const hasModel = Boolean(selectedAiModel());
+  const hasConnection = Boolean(selectedAiConnection());
+  els.aiSendButton.disabled = state.aiBusy || !configured || !hasModel || !hasConnection;
+  els.aiPrompt.disabled = state.aiBusy || !configured || !hasModel || !hasConnection;
+  els.aiModelSelect.disabled = state.aiBusy || !configured || (state.aiConfig?.models || []).length === 0;
+  els.aiConnectionSelect.disabled = state.aiBusy || aiEligibleConnections().length === 0;
+  els.aiResetButton.disabled = state.aiBusy;
+  els.aiConfigStatus.textContent = configured
+    ? `已配置 ${(state.aiConfig.models || []).length} 个模型`
+    : "未配置 AI_MODELS 或 AI_API_BASE / AI_API_KEY / AI_MODEL";
+  els.aiConfigStatus.classList.toggle("error", state.aiConfig && !configured);
+}
+
+function renderAiMessages() {
+  els.aiMessageList.innerHTML = "";
+  if (state.aiMessages.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "ai-empty";
+    empty.textContent = "选择数据库后，可以直接问表结构、生成查询或分析数据。";
+    els.aiMessageList.appendChild(empty);
+    return;
+  }
+
+  state.aiMessages.forEach((message) => {
+    const item = document.createElement("article");
+    item.className = `ai-message ${message.role === "user" ? "user" : "assistant"}`;
+    const label = document.createElement("div");
+    label.className = "ai-message-label";
+    label.textContent = message.role === "user" ? "你" : "AI";
+    const content = document.createElement("div");
+    content.className = "ai-message-content";
+    content.textContent = message.content || "";
+    item.append(label, content);
+    els.aiMessageList.appendChild(item);
+  });
+  els.aiMessageList.scrollTop = els.aiMessageList.scrollHeight;
+}
+
+function showAiSql(sql) {
+  state.aiLastSql = sql || "";
+  els.aiSqlText.textContent = state.aiLastSql;
+  els.aiSqlCard.classList.toggle("hidden", !state.aiLastSql);
+}
+
+async function loadAiConfig() {
+  try {
+    state.aiConfig = await api("/api/ai/config");
+  } catch (error) {
+    state.aiConfig = { configured: false, model: "", api_base: "", models: [], error: error.message };
+  }
+  renderAiModelOptions();
+  updateAiControls();
+}
+
+async function ensureAiSession() {
+  const connection = selectedAiConnection();
+  if (!connection) {
+    throw new Error("请先保存并选择一个 SQL 数据库连接");
+  }
+  if (state.aiSessionId) {
+    return state.aiSessionId;
+  }
+  const data = await api("/api/ai/sessions", {
+    method: "POST",
+    body: JSON.stringify({
+      connection: connectionPayload(connection),
+      connection_name: connection.name,
+    }),
+  });
+  state.aiSessionId = data.session_id;
+  sessionStorage.setItem(AI_SESSION_KEY, state.aiSessionId);
+  return state.aiSessionId;
+}
+
+function resetAiSession({ keepMessages = false } = {}) {
+  state.aiSessionId = null;
+  sessionStorage.removeItem(AI_SESSION_KEY);
+  showAiSql("");
+  if (!keepMessages) {
+    state.aiMessages = [];
+    renderAiMessages();
+  }
+}
+
+async function submitAiMessage(event) {
+  event.preventDefault();
+  const text = els.aiPrompt.value.trim();
+  if (!text || state.aiBusy) return;
+
+  state.aiBusy = true;
+  updateAiControls();
+  showAiSql("");
+  els.aiPrompt.value = "";
+  state.aiMessages.push({ role: "user", content: text });
+  state.aiMessages.push({ role: "assistant", content: "正在分析..." });
+  renderAiMessages();
+
+  try {
+    const sessionId = await ensureAiSession();
+    const data = await api("/api/ai/chat", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId,
+        message: text,
+        limit: Number(els.limitInput.value || QUERY_ROW_LIMIT),
+        model_id: state.aiModelId,
+      }),
+    });
+    state.aiMessages.pop();
+    state.aiMessages.push({
+      role: "assistant",
+      content: data.message?.content || "没有返回内容",
+    });
+    showAiSql(data.message?.sql || "");
+  } catch (error) {
+    state.aiMessages.pop();
+    state.aiMessages.push({ role: "assistant", content: error.message });
+    if (/session/i.test(error.message) || /会话/.test(error.message)) {
+      resetAiSession({ keepMessages: true });
+    }
+  } finally {
+    state.aiBusy = false;
+    renderAiMessages();
+    updateAiControls();
+  }
+}
+
+function useAiSqlInEditor() {
+  if (!state.aiLastSql) return;
+  els.sqlEditor.value = state.aiLastSql;
+  els.sqlEditor.focus();
+  setMessage("AI 生成的 SQL 已放入编辑器");
 }
 
 function loadColumnWidths() {
@@ -484,6 +716,7 @@ function renderConnections() {
     els.connectionList.appendChild(item);
   });
   updateConnectionStatusSummary();
+  renderAiConnectionOptions();
 }
 
 function connectionIconClass(connection) {
@@ -1808,6 +2041,23 @@ els.cancelConnectionButton.addEventListener("click", closeConnectionModal);
 els.closeDeleteModal.addEventListener("click", closeDeleteConnectionModal);
 els.cancelDeleteButton.addEventListener("click", closeDeleteConnectionModal);
 els.confirmDeleteButton.addEventListener("click", confirmDeleteConnection);
+els.aiForm.addEventListener("submit", submitAiMessage);
+els.aiUseSqlButton.addEventListener("click", useAiSqlInEditor);
+els.aiResetButton.addEventListener("click", () => resetAiSession());
+els.aiModelSelect.addEventListener("change", () => {
+  state.aiModelId = els.aiModelSelect.value || null;
+  if (state.aiModelId) {
+    sessionStorage.setItem(AI_MODEL_KEY, state.aiModelId);
+  } else {
+    sessionStorage.removeItem(AI_MODEL_KEY);
+  }
+  updateAiControls();
+});
+els.aiConnectionSelect.addEventListener("change", () => {
+  state.aiConnectionId = els.aiConnectionSelect.value || null;
+  resetAiSession();
+  updateAiControls();
+});
 els.connectionModal.addEventListener("click", (event) => {
   if (event.target === els.connectionModal) {
     closeConnectionModal();
@@ -1834,6 +2084,8 @@ async function start() {
   els.viewTitle.textContent = state.connections.length > 0 ? "选择连接" : "添加连接";
   els.viewMeta.textContent = "连接信息保存在浏览器本地，不会自动连接数据库";
   setMessage("添加或点击左侧连接后开始浏览数据");
+  renderAiMessages();
+  await loadAiConfig();
 }
 
 [

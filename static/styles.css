@@ -10,6 +10,7 @@
   --danger: #b42318;
   --shadow: 0 12px 30px rgba(19, 31, 49, 0.08);
   --sidebar-width: 280px;
+  --ai-panel-width: 360px;
 }
 
 * {
@@ -20,7 +21,7 @@ body {
   margin: 0;
   min-height: 100vh;
   display: grid;
-  grid-template-columns: var(--sidebar-width) 6px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) 6px minmax(0, 1fr) var(--ai-panel-width);
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -766,6 +767,205 @@ body.resizing {
   padding: 18px 26px 26px;
 }
 
+.ai-panel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  min-width: 0;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--line);
+  background: #f8fafc;
+}
+
+.ai-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 18px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.ai-header > div {
+  min-width: 0;
+}
+
+.ai-header h2,
+.ai-header p {
+  margin: 0;
+}
+
+.ai-header h2 {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.ai-header p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-header p.error {
+  color: var(--danger);
+}
+
+.ai-header button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.ai-controls {
+  display: grid;
+  gap: 8px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  background: #f1f5f9;
+}
+
+.ai-controls select {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 10px;
+  color: var(--text);
+  background: #ffffff;
+}
+
+.ai-messages {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 18px;
+}
+
+.ai-empty {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.ai-message {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ai-message-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ai-message-content {
+  width: fit-content;
+  max-width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: #ffffff;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ai-message.user {
+  justify-items: end;
+}
+
+.ai-message.user .ai-message-content {
+  color: #062421;
+  background: #ccfbf1;
+  border-color: #99f6e4;
+}
+
+.ai-sql-card {
+  margin: 0 18px 12px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #eff6ff;
+}
+
+.ai-sql-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  color: #1e3a8a;
+  font-size: 12px;
+  font-weight: 800;
+  border-bottom: 1px solid #bfdbfe;
+}
+
+.ai-sql-header button {
+  min-height: 28px;
+  padding: 0 8px;
+  color: #1e3a8a;
+  background: #ffffff;
+  border-color: #bfdbfe;
+}
+
+#aiSqlText {
+  max-height: 160px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  color: #0f172a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.ai-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 12px 18px 18px;
+  border-top: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.ai-form textarea {
+  min-width: 0;
+  width: 100%;
+  min-height: 74px;
+  max-height: 140px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  color: var(--text);
+  background: #ffffff;
+  line-height: 1.45;
+}
+
+.ai-form button {
+  align-self: end;
+  min-width: 66px;
+  color: #ffffff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.ai-form button:hover {
+  background: var(--accent-strong);
+}
+
 .message {
   min-height: 24px;
   color: var(--muted);
@@ -911,21 +1111,34 @@ td.error {
 @media (max-width: 840px) {
   body {
     grid-template-columns: 1fr;
+    overflow: auto;
   }
 
   .sidebar {
     min-height: auto;
+    height: auto;
   }
 
   .resize-handle {
     display: none;
   }
 
+  .workspace,
+  .ai-panel {
+    height: auto;
+    min-height: 70vh;
+  }
+
+  .ai-panel {
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
   .query-panel {
     grid-template-columns: 1fr;
   }
 
-  .table-wrap {
-    height: 60vh;
+  .ai-form {
+    grid-template-columns: 1fr;
   }
 }

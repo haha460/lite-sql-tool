@@ -71,6 +71,32 @@
       </section>
     </main>
 
+    <aside class="ai-panel" id="aiAssistantPanel">
+      <header class="ai-header">
+        <div>
+          <h2>AI 助手</h2>
+          <p id="aiConfigStatus">检查配置中...</p>
+        </div>
+        <button id="aiResetButton" type="button" title="重置会话">重置</button>
+      </header>
+      <div class="ai-controls">
+        <select id="aiModelSelect" title="选择 AI 模型"></select>
+        <select id="aiConnectionSelect" title="选择数据库连接"></select>
+      </div>
+      <div id="aiMessageList" class="ai-messages"></div>
+      <div id="aiSqlCard" class="ai-sql-card hidden">
+        <div class="ai-sql-header">
+          <span>生成的 SQL</span>
+          <button id="aiUseSqlButton" type="button">放入编辑器</button>
+        </div>
+        <pre id="aiSqlText"></pre>
+      </div>
+      <form id="aiForm" class="ai-form">
+        <textarea id="aiPrompt" rows="3" placeholder="例如：分析 users 表的活跃用户情况" spellcheck="false"></textarea>
+        <button id="aiSendButton" type="submit">发送</button>
+      </form>
+    </aside>
+
     <div id="connectionModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="connectionModalTitle">
       <div class="modal-panel">
         <div class="modal-header">
@@ -132,6 +158,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=query-scroll-20260626-1"></script>
+    <script src="/static/app.js?v=ai-models-20260626-1"></script>
   </body>
 </html>
