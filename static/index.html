@@ -16,10 +16,14 @@
         </div>
       </div>
       <div class="status-row">
-        <span id="sqlStatus" class="status-dot pending"></span>
-        <span>SQL</span>
-        <span id="redisStatus" class="status-dot pending"></span>
-        <span>Redis</span>
+        <div class="status-pill" title="已连接的 SQL 数据库数量">
+          <span id="sqlStatus" class="status-dot pending"></span>
+          <span id="sqlStatusLabel">SQL 0</span>
+        </div>
+        <div class="status-pill" title="已连接的 Redis 数据库数量">
+          <span id="redisStatus" class="status-dot pending"></span>
+          <span id="redisStatusLabel">Redis 0</span>
+        </div>
       </div>
       <div class="sidebar-section">
         <div class="section-header">
@@ -75,18 +79,19 @@
         </div>
         <form id="connectionForm" class="connection-form">
           <input id="connectionName" type="text" placeholder="连接名称" autocomplete="off">
+          <select id="driverSelect" title="数据库类型">
+            <option value="mysql" selected>MySQL</option>
+            <option value="postgresql">PostgreSQL / PG</option>
+            <option value="sqlite">SQLite</option>
+            <option value="clickhouse">ClickHouse</option>
+            <option value="redis">Redis</option>
+          </select>
           <div class="mode-tabs">
             <label><input type="radio" name="connectionMode" value="dsn" checked> 连接串</label>
             <label><input type="radio" name="connectionMode" value="fields"> IP/Port</label>
           </div>
           <div id="dsnFields" class="form-group">
-            <select id="driverSelect" title="数据库类型">
-              <option value="mysql" selected>MySQL</option>
-              <option value="sqlite">SQLite</option>
-              <option value="postgresql">PostgreSQL</option>
-              <option value="clickhouse">ClickHouse</option>
-            </select>
-            <textarea id="dsnInput" spellcheck="false" placeholder="local_user:local_password@(127.0.0.1:3306)/local_db?charset=utf8&loc=Asia%2FShanghai&parseTime=true"></textarea>
+            <input id="dsnInput" type="text" spellcheck="false" placeholder="local_user:local_password@(127.0.0.1:3306)/local_db?charset=utf8&loc=Asia%2FShanghai&parseTime=true" autocomplete="off">
           </div>
           <div id="fieldInputs" class="form-group hidden">
             <input id="dbHost" type="text" placeholder="IP / Host" autocomplete="off">
@@ -95,8 +100,16 @@
             <input id="dbPassword" type="password" placeholder="密码" autocomplete="off">
             <input id="dbName" type="text" placeholder="数据库名" autocomplete="off">
           </div>
+          <label id="readOnlyRow" class="checkbox-row">
+            <input id="readOnlyConnection" type="checkbox">
+            <span>只读连接</span>
+          </label>
+          <label id="redisEnabledRow" class="checkbox-row">
+            <input id="redisEnabled" type="checkbox">
+            <span>启用 Redis</span>
+          </label>
           <input id="sqlUrl" type="text" placeholder="生成的 SQL URL" autocomplete="off">
-          <input id="redisUrl" type="text" placeholder="Redis URL" autocomplete="off">
+          <input id="redisUrl" class="hidden" type="text" placeholder="Redis URL" autocomplete="off">
           <div class="modal-actions">
             <button id="cancelConnectionButton" type="button">取消</button>
             <button type="submit">保存连接</button>
@@ -105,6 +118,20 @@
       </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <div id="deleteConnectionModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="deleteConnectionTitle">
+      <div class="modal-panel confirm-panel">
+        <div class="modal-header">
+          <h3 id="deleteConnectionTitle">删除连接</h3>
+          <button id="closeDeleteModal" type="button" title="关闭">关闭</button>
+        </div>
+        <p id="deleteConnectionText" class="confirm-text"></p>
+        <div class="modal-actions">
+          <button id="cancelDeleteButton" type="button">取消</button>
+          <button id="confirmDeleteButton" class="danger-button" type="button">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/app.js?v=query-scroll-20260626-1"></script>
   </body>
 </html>

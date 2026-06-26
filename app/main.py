@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import sqlalchemy
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,8 +33,9 @@ DEFAULT_QUERY_LIMIT = 100
 
 
 class ConnectionInfo(BaseModel):
-    sql_url: str = Field(default=DEFAULT_SQL_URL, min_length=1)
-    redis_url: str = Field(default=DEFAULT_REDIS_URL, min_length=1)
+    sql_url: str | None = None
+    redis_url: str | None = None
+    readonly: bool = False
 
 
 class SqlQueryRequest(BaseModel):
@@ -42,6 +43,7 @@ class SqlQueryRequest(BaseModel):
     sql: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = Field(default=DEFAULT_QUERY_LIMIT, ge=1, le=1000)
+    offset: int = Field(default=0, ge=0)
 
 
 class CellUpdateRequest(BaseModel):
@@ -85,9 +87,18 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def disable_frontend_cache(request: Request, call_next: Any) -> Any:
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.get("/api/health")
@@ -112,42 +123,57 @@ def health() -> dict[str, Any]:
 
 @app.post("/api/connections/test")
 def test_connection(connection: ConnectionInfo) -> dict[str, Any]:
-    engine = create_sql_engine(connection.sql_url)
+    if not connection.sql_url and not connection.redis_url:
+        raise HTTPException(status_code=400, detail="SQL URL or Redis URL is required")
+
+    sql_ok = False
     redis_ok = False
     redis_error = None
+    engine = None
 
-    try:
-        with engine.connect() as sql_connection:
-            sql_connection.execute(text("select 1"))
-    except Exception as exc:
+    if connection.sql_url:
+        engine = create_sql_engine(connection.sql_url)
+        try:
+            with engine.connect() as sql_connection:
+                sql_connection.execute(text("select 1"))
+                sql_ok = True
+        except Exception as exc:
+            engine.dispose()
+            raise HTTPException(status_code=400, detail=f"SQL connection failed: {exc}") from exc
+
+    if connection.redis_url:
+        try:
+            create_redis_client(connection.redis_url).ping()
+            redis_ok = True
+        except Exception as exc:
+            redis_error = str(exc)
+
+    if engine:
         engine.dispose()
-        raise HTTPException(status_code=400, detail=f"SQL connection failed: {exc}") from exc
-
-    try:
-        create_redis_client(connection.redis_url).ping()
-        redis_ok = True
-    except Exception as exc:
-        redis_error = str(exc)
-
-    engine.dispose()
-    return {"sql": True, "redis": redis_ok, "redis_error": redis_error}
+    return {"sql": sql_ok, "redis": redis_ok, "redis_error": redis_error}
 
 
 @app.post("/api/tables")
 def list_tables(connection: ConnectionInfo) -> dict[str, Any]:
+    ensure_sql_enabled(connection)
     engine = create_sql_engine(connection.sql_url)
     try:
         inspector = inspect(engine)
+        table_names = inspector.get_table_names()
+        stats_by_table = load_table_stats(engine, table_names)
         tables = []
-        for table_name in inspector.get_table_names():
+        for table_name in table_names:
             columns = inspector.get_columns(table_name)
             pk = inspector.get_pk_constraint(table_name).get("constrained_columns") or []
             foreign_keys = safe_inspect_list(inspector.get_foreign_keys, table_name)
             indexes = safe_inspect_list(inspector.get_indexes, table_name)
+            stats = stats_by_table.get(table_name, {})
             tables.append(
                 {
                     "name": table_name,
                     "primary_key": pk[0] if pk else None,
+                    "row_count": stats.get("row_count"),
+                    "size_bytes": stats.get("size_bytes"),
                     "columns": [
                         {
                             "name": column["name"],
@@ -190,48 +216,67 @@ def get_table_rows(
     connection: ConnectionInfo,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    include_total: bool = Query(default=False),
 ) -> dict[str, Any]:
+    ensure_sql_enabled(connection)
     engine = create_sql_engine(connection.sql_url)
-    ensure_table_exists(engine, table_name)
-    table_sql = quote_identifier(engine, table_name)
-    sql = f"select * from {table_sql} limit :limit offset :offset"
+    try:
+        ensure_table_exists(engine, table_name)
+        table_sql = quote_identifier(engine, table_name)
+        sql = f"select * from {table_sql} limit :limit offset :offset"
 
-    with engine.connect() as connection:
-        rows = connection.execute(text(sql), {"limit": limit, "offset": offset}).fetchall()
-        total = connection.execute(text(f"select count(*) from {table_sql}")).scalar_one()
+        with engine.connect() as connection:
+            fetched_rows = connection.execute(text(sql), {"limit": limit + 1, "offset": offset}).fetchall()
+            visible_rows = fetched_rows[:limit]
+            total = None
+            if include_total:
+                total = connection.execute(text(f"select count(*) from {table_sql}")).scalar_one()
 
-    engine.dispose()
-    return {"rows": [row_to_dict(row) for row in rows], "total": total}
+        return {
+            "rows": [row_to_dict(row) for row in visible_rows],
+            "has_more": len(fetched_rows) > limit,
+            "loaded": offset + len(visible_rows),
+            "total": total,
+        }
+    finally:
+        engine.dispose()
 
 
 @app.post("/api/query")
 def run_query(payload: SqlQueryRequest) -> dict[str, Any]:
+    ensure_sql_enabled(payload.connection)
     if not SELECT_RE.match(payload.sql):
         raise HTTPException(status_code=400, detail="Only SELECT/WITH queries are allowed here")
 
     sql = payload.sql.strip().rstrip(";")
-    limited_sql = sql
-    if " limit " not in sql.lower():
-        limited_sql = f"select * from ({sql}) as visual_query limit :__limit"
-
+    limited_sql = f"select * from ({sql}) as visual_query limit :__limit offset :__offset"
     params = dict(payload.params)
-    params["__limit"] = payload.limit
+    params["__limit"] = payload.limit + 1
+    params["__offset"] = payload.offset
 
     engine = create_sql_engine(payload.connection.sql_url)
-    with engine.connect() as connection:
-        result = connection.execute(text(limited_sql), params)
-        rows = result.fetchall()
+    try:
+        with engine.connect() as connection:
+            result = connection.execute(text(limited_sql), params)
+            fetched_rows = result.fetchall()
+            visible_rows = fetched_rows[: payload.limit]
 
-    engine.dispose()
-    return {
-        "columns": list(result.keys()),
-        "rows": [row_to_dict(row) for row in rows],
-        "limit": payload.limit,
-    }
+        return {
+            "columns": list(result.keys()),
+            "rows": [row_to_dict(row) for row in visible_rows],
+            "limit": payload.limit,
+            "offset": payload.offset,
+            "loaded": payload.offset + len(visible_rows),
+            "has_more": len(fetched_rows) > payload.limit,
+        }
+    finally:
+        engine.dispose()
 
 
 @app.patch("/api/tables/{table_name}/cell")
 def update_cell(table_name: str, payload: CellUpdateRequest) -> dict[str, Any]:
+    ensure_sql_enabled(payload.connection)
+    ensure_writable(payload.connection)
     engine = create_sql_engine(payload.connection.sql_url)
     columns = ensure_table_exists(engine, table_name)
     column_names = {column["name"] for column in columns}
@@ -267,6 +312,8 @@ def update_cell(table_name: str, payload: CellUpdateRequest) -> dict[str, Any]:
 
 @app.post("/api/tables/{table_name}/rows/insert")
 def insert_row(table_name: str, payload: InsertRowRequest) -> dict[str, Any]:
+    ensure_sql_enabled(payload.connection)
+    ensure_writable(payload.connection)
     engine = create_sql_engine(payload.connection.sql_url)
     try:
         columns = ensure_table_exists(engine, table_name)
@@ -293,6 +340,8 @@ def insert_row(table_name: str, payload: InsertRowRequest) -> dict[str, Any]:
 
 @app.post("/api/tables/{table_name}/rows/delete")
 def delete_rows(table_name: str, payload: DeleteRowsRequest) -> dict[str, Any]:
+    ensure_sql_enabled(payload.connection)
+    ensure_writable(payload.connection)
     engine = create_sql_engine(payload.connection.sql_url)
     try:
         columns = ensure_table_exists(engine, table_name)
@@ -315,6 +364,7 @@ def delete_rows(table_name: str, payload: DeleteRowsRequest) -> dict[str, Any]:
 
 @app.post("/api/redis/keys")
 def list_redis_keys(payload: RedisKeysRequest) -> dict[str, Any]:
+    ensure_redis_enabled(payload.connection)
     client = create_redis_client(payload.connection.redis_url)
     keys = []
     for key in client.scan_iter(match=payload.pattern, count=payload.limit):
@@ -326,6 +376,7 @@ def list_redis_keys(payload: RedisKeysRequest) -> dict[str, Any]:
 
 @app.post("/api/redis/value")
 def get_redis_value(payload: RedisValueRequest) -> dict[str, Any]:
+    ensure_redis_enabled(payload.connection)
     client = create_redis_client(payload.connection.redis_url)
     value_type = client.type(payload.key)
 
@@ -363,6 +414,114 @@ def safe_inspect_list(fn: Any, table_name: str) -> list[dict[str, Any]]:
     return value if isinstance(value, list) else []
 
 
+def load_table_stats(engine: Engine, table_names: list[str]) -> dict[str, dict[str, int | None]]:
+    stats = {name: {"row_count": None, "size_bytes": None} for name in table_names}
+    if not table_names:
+        return stats
+
+    dialect = engine.dialect.name
+    try:
+        if dialect == "mysql":
+            return load_mysql_table_stats(engine, stats)
+        if dialect == "postgresql":
+            return load_postgresql_table_stats(engine, stats)
+        if dialect == "clickhouse":
+            return load_clickhouse_table_stats(engine, stats)
+        if dialect == "sqlite":
+            return load_sqlite_table_stats(engine, stats)
+    except Exception:
+        return stats
+    return stats
+
+
+def load_mysql_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+    sql = """
+        select
+          table_name,
+          table_rows as row_count,
+          coalesce(data_length, 0) + coalesce(index_length, 0) as size_bytes
+        from information_schema.tables
+        where table_schema = database()
+    """
+    with engine.connect() as connection:
+        rows = connection.execute(text(sql)).mappings().all()
+    for row in rows:
+        table_name = row.get("table_name")
+        if table_name in stats:
+            stats[table_name]["row_count"] = optional_int(row.get("row_count"))
+            stats[table_name]["size_bytes"] = optional_int(row.get("size_bytes"))
+    return stats
+
+
+def load_postgresql_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+    sql = """
+        select
+          c.relname as table_name,
+          greatest(c.reltuples::bigint, 0) as row_count,
+          pg_total_relation_size(c.oid) as size_bytes
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        where c.relkind in ('r', 'p')
+          and n.nspname = current_schema()
+    """
+    with engine.connect() as connection:
+        rows = connection.execute(text(sql)).mappings().all()
+    for row in rows:
+        table_name = row.get("table_name")
+        if table_name in stats:
+            stats[table_name]["row_count"] = optional_int(row.get("row_count"))
+            stats[table_name]["size_bytes"] = optional_int(row.get("size_bytes"))
+    return stats
+
+
+def load_clickhouse_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+    sql = """
+        select
+          name as table_name,
+          total_rows as row_count,
+          total_bytes as size_bytes
+        from system.tables
+        where database = currentDatabase()
+    """
+    with engine.connect() as connection:
+        rows = connection.execute(text(sql)).mappings().all()
+    for row in rows:
+        table_name = row.get("table_name")
+        if table_name in stats:
+            stats[table_name]["row_count"] = optional_int(row.get("row_count"))
+            stats[table_name]["size_bytes"] = optional_int(row.get("size_bytes"))
+    return stats
+
+
+def load_sqlite_table_stats(engine: Engine, stats: dict[str, dict[str, int | None]]) -> dict[str, dict[str, int | None]]:
+    with engine.connect() as connection:
+        for table_name in stats:
+            try:
+                table_sql = quote_identifier(engine, table_name)
+                stats[table_name]["row_count"] = optional_int(
+                    connection.execute(text(f"select count(*) from {table_sql}")).scalar_one()
+                )
+            except Exception:
+                stats[table_name]["row_count"] = None
+
+            try:
+                stats[table_name]["size_bytes"] = optional_int(
+                    connection.execute(text("select sum(pgsize) from dbstat where name = :name"), {"name": table_name}).scalar()
+                )
+            except Exception:
+                stats[table_name]["size_bytes"] = None
+    return stats
+
+
+def optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def quote_identifier(engine: Engine, identifier: str) -> str:
     if not IDENTIFIER_RE.match(identifier):
         raise HTTPException(status_code=400, detail=f"Invalid identifier: {identifier}")
@@ -374,6 +533,21 @@ def reflected_table(engine: Engine, table_name: str) -> Table:
         raise HTTPException(status_code=400, detail=f"Invalid identifier: {table_name}")
     metadata = MetaData()
     return Table(table_name, metadata, autoload_with=engine)
+
+
+def ensure_writable(connection: ConnectionInfo) -> None:
+    if connection.readonly:
+        raise HTTPException(status_code=403, detail="This connection is read-only")
+
+
+def ensure_sql_enabled(connection: ConnectionInfo) -> None:
+    if not connection.sql_url:
+        raise HTTPException(status_code=400, detail="SQL is not enabled for this connection")
+
+
+def ensure_redis_enabled(connection: ConnectionInfo) -> None:
+    if not connection.redis_url:
+        raise HTTPException(status_code=400, detail="Redis is not enabled for this connection")
 
 
 def normalize_cell_value(value: Any) -> Any:

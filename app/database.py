@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
+from urllib.parse import quote, unquote
 
 import redis
 import sqlalchemy
@@ -34,20 +35,51 @@ def get_engine() -> Engine:
 
 
 def create_sql_engine(sql_url: str) -> Engine:
+    normalized_sql_url = normalize_sql_url(sql_url)
     connect_args: dict[str, Any] = {}
-    if sql_url.startswith("sqlite"):
+    if normalized_sql_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
-    if sql_url.startswith("mysql"):
+    if normalized_sql_url.startswith("mysql"):
         connect_args["connect_timeout"] = 5
-    if sql_url.startswith("postgresql"):
+    if normalized_sql_url.startswith("postgresql"):
         connect_args["connect_timeout"] = 5
 
     return sqlalchemy.create_engine(
-        sql_url,
+        normalized_sql_url,
         pool_pre_ping=True,
         future=True,
         connect_args=connect_args,
     )
+
+
+def normalize_sql_url(sql_url: str) -> str:
+    """Allow users to paste DB URLs with raw password characters."""
+    cleaned = sql_url.strip()
+    if "://" not in cleaned or cleaned.startswith("sqlite"):
+        return cleaned
+
+    scheme, rest = cleaned.split("://", 1)
+    if scheme in {"postgres", "postgresql"}:
+        scheme = "postgresql+psycopg"
+    slash_index = rest.find("/")
+    if slash_index == -1:
+        authority = rest
+        suffix = ""
+    else:
+        authority = rest[:slash_index]
+        suffix = rest[slash_index:]
+
+    if "@" not in authority:
+        return cleaned
+
+    userinfo, hostinfo = authority.rsplit("@", 1)
+    if ":" in userinfo:
+        username, password = userinfo.split(":", 1)
+        encoded_userinfo = f"{quote(unquote(username), safe='')}:{quote(unquote(password), safe='')}"
+    else:
+        encoded_userinfo = quote(unquote(userinfo), safe="")
+
+    return f"{scheme}://{encoded_userinfo}@{hostinfo}{suffix}"
 
 
 @lru_cache

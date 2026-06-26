@@ -2,5 +2,18 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 app.db
 .DS_Store
+.venv/
+docs/
+
+# AI assistant local runtime and secrets
+.runtime/
+.opencode/local/
+opencode.local.json
+ai_sessions.db
+ai_sessions.sqlite
+*.sqlite-journal
+*.db-journal
