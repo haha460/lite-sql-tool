@@ -26,7 +26,9 @@ npm install -g opencode-ai
 
 ## 数据库配置
 
-Web 前端支持直接添加连接。连接信息保存在浏览器本地 `localStorage`，重新打开页面后会显示，但不会自动连接数据库；只有点击某个连接时，才会把连接信息发给后端并连接数据库。
+Web 前端支持直接添加连接。连接信息保存在后端本机 `.runtime/connections.json`，启动服务后会自动加载；只有点击某个连接时，才会真正连接数据库。该文件可能包含数据库密码，`.runtime/` 已加入 `.gitignore`，不会提交到 git。
+
+旧版本保存在浏览器 `localStorage` 的连接会在首次打开页面时自动迁移到 `.runtime/connections.json`，迁移成功后清理浏览器里的旧连接配置。
 
 默认可以使用当前目录的 SQLite 数据库：
 
@@ -232,13 +234,15 @@ OPENCODE_PROVIDER=huayan
 - 上方 SQL 编辑器支持 `SELECT` / `WITH` 查询
 - SQL 查询默认限制 100 行，查询结果只读，并支持滚动继续加载更多结果
 - 右侧 AI 助手支持选择模型和已保存 SQL 连接，通过自然语言读取表结构、生成只读 SQL、执行查询并总结结果
-- AI 助手按连接记录当前会话，支持恢复历史消息；助手回复支持标题、列表、代码块、表格、链接等 Markdown 渲染
+- AI 助手按连接记录当前会话，连接和会话的对应关系保存在后端本地 `.runtime/ai_session_links.json`，支持恢复历史消息；助手回复支持标题、列表、代码块、表格、链接等 Markdown 渲染
 - AI 助手面板支持拖动调宽、收起和重新打开，并显示当前是直连模式还是 OpenCode 模式
 
 ## API
 
 ```text
 GET    /api/health
+GET    /api/connections
+PUT    /api/connections
 POST   /api/connections/test
 POST   /api/tables
 POST   /api/tables/{table_name}/rows
@@ -249,7 +253,10 @@ POST   /api/query
 POST   /api/redis/keys
 POST   /api/redis/value
 GET    /api/ai/config
+GET    /api/ai/session-links
+PUT    /api/ai/session-links
 POST   /api/ai/sessions
+POST   /api/ai/sessions/lookup
 GET    /api/ai/sessions/{session_id}/messages
 POST   /api/ai/chat
 POST   /api/ai/tool/schema

@@ -953,7 +953,8 @@ body.ai-panel-collapsed .ai-resize-handle {
   align-content: start;
   gap: 10px;
   min-height: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 16px 18px;
 }
 
@@ -966,6 +967,7 @@ body.ai-panel-collapsed .ai-resize-handle {
 .ai-message {
   display: grid;
   gap: 5px;
+  width: 100%;
   min-width: 0;
 }
 
@@ -977,6 +979,7 @@ body.ai-panel-collapsed .ai-resize-handle {
 
 .ai-message-content {
   width: fit-content;
+  min-width: 0;
   max-width: 100%;
   padding: 9px 11px;
   border: 1px solid var(--line);
@@ -990,6 +993,7 @@ body.ai-panel-collapsed .ai-resize-handle {
 }
 
 .ai-message-content.markdown {
+  width: 100%;
   white-space: normal;
 }
 
@@ -1003,6 +1007,7 @@ body.ai-panel-collapsed .ai-resize-handle {
 
 .ai-message-content.markdown p {
   margin: 0 0 8px;
+  overflow-wrap: anywhere;
 }
 
 .ai-message-content.markdown h1,
@@ -1023,11 +1028,28 @@ body.ai-panel-collapsed .ai-resize-handle {
 
 .ai-message-content.markdown li {
   margin: 3px 0;
+  overflow-wrap: anywhere;
+}
+
+.ai-message-content.markdown .markdown-task-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  list-style: none;
+  margin-left: -18px;
+}
+
+.ai-message-content.markdown .markdown-task-item input {
+  flex: 0 0 auto;
+  margin-top: 3px;
 }
 
 .ai-message-content.markdown pre {
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: hidden;
   margin: 8px 0;
   padding: 9px 10px;
   border: 1px solid #d8dee8;
@@ -1074,24 +1096,55 @@ body.ai-panel-collapsed .ai-resize-handle {
   text-decoration: underline;
 }
 
+.ai-message-content.markdown img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
 .ai-message-content.markdown hr {
   border: 0;
   border-top: 1px solid var(--line);
   margin: 10px 0;
 }
 
+.markdown-details {
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.markdown-details summary {
+  padding: 7px 9px;
+  color: #334155;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.markdown-details > div {
+  padding: 0 9px 8px;
+}
+
 .markdown-table-wrap {
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: hidden;
   margin: 8px 0;
   border: 1px solid var(--line);
   border-radius: 6px;
 }
 
 .markdown-table-wrap table {
-  width: max-content;
+  width: 100%;
   min-width: 100%;
   border-collapse: collapse;
+  table-layout: auto;
   font-size: 12px;
 }
 
@@ -1100,7 +1153,12 @@ body.ai-panel-collapsed .ai-resize-handle {
   padding: 6px 8px;
   border-bottom: 1px solid var(--line);
   text-align: left;
-  white-space: nowrap;
+  max-width: 260px;
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  vertical-align: top;
 }
 
 .markdown-table-wrap th {

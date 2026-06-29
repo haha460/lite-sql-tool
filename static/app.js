@@ -27,7 +27,7 @@ const state = {
   virtualRowCount: 0,
   virtualRenderFrame: 0,
   aiConfig: null,
-  aiSessionId: sessionStorage.getItem("sqlRedisVisualAiSessionId") || null,
+  aiSessionId: null,
   aiSessionByConnection: {},
   aiConnectionId: null,
   aiMessages: [],
@@ -35,12 +35,12 @@ const state = {
   aiLastSql: "",
   aiModelId: sessionStorage.getItem("sqlRedisVisualAiModelId") || null,
   aiPanelCollapsed: localStorage.getItem("sqlRedisVisualAiPanelCollapsed") === "1",
+  aiRestoreRequestId: 0,
 };
 
 const STORAGE_KEY = "sqlRedisVisualConnections";
 const SIDEBAR_WIDTH_KEY = "sqlRedisVisualSidebarWidth";
 const COLUMN_WIDTHS_KEY = "sqlRedisVisualColumnWidths";
-const AI_SESSION_KEY = "sqlRedisVisualAiSessionId";
 const AI_SESSION_BY_CONNECTION_KEY = "sqlRedisVisualAiSessionByConnection";
 const AI_MODEL_KEY = "sqlRedisVisualAiModelId";
 const AI_PANEL_WIDTH_KEY = "sqlRedisVisualAiPanelWidth";
@@ -176,42 +176,68 @@ function selectedAiConnection() {
 function loadAiSessionMap() {
   try {
     const parsed = JSON.parse(sessionStorage.getItem(AI_SESSION_BY_CONNECTION_KEY) || "{}");
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    return normalizeAiSessionMap(parsed);
   } catch {
     return {};
   }
 }
 
-function saveAiSessionMap() {
+function normalizeAiSessionMap(links) {
+  if (!links || typeof links !== "object" || Array.isArray(links)) return {};
+  const seenSessionIds = new Set();
+  const cleanMap = {};
+  Object.entries(links).forEach(([connectionId, sessionId]) => {
+    if (!connectionId || !sessionId || seenSessionIds.has(sessionId)) return;
+    seenSessionIds.add(sessionId);
+    cleanMap[connectionId] = sessionId;
+  });
+  return cleanMap;
+}
+
+async function loadAiSessionLinks() {
+  try {
+    const data = await api("/api/ai/session-links");
+    const serverLinks = normalizeAiSessionMap(data.links);
+    const legacyLinks = loadAiSessionMap();
+    state.aiSessionByConnection = normalizeAiSessionMap({ ...legacyLinks, ...serverLinks });
+    sessionStorage.removeItem(AI_SESSION_BY_CONNECTION_KEY);
+    if (Object.keys(legacyLinks).length > 0) {
+      await saveAiSessionMap();
+    }
+  } catch (error) {
+    state.aiSessionByConnection = loadAiSessionMap();
+    setMessage(`读取 AI 会话映射失败：${error.message}`, true);
+  }
+}
+
+async function saveAiSessionMap() {
+  state.aiSessionByConnection = normalizeAiSessionMap(state.aiSessionByConnection);
   sessionStorage.setItem(AI_SESSION_BY_CONNECTION_KEY, JSON.stringify(state.aiSessionByConnection));
+  try {
+    await api("/api/ai/session-links", {
+      method: "PUT",
+      body: JSON.stringify({ links: state.aiSessionByConnection }),
+    });
+    sessionStorage.removeItem(AI_SESSION_BY_CONNECTION_KEY);
+  } catch (error) {
+    setMessage(`保存 AI 会话映射失败：${error.message}`, true);
+  }
 }
 
-function rememberCurrentAiSession() {
+async function rememberCurrentAiSession() {
   if (!state.aiConnectionId || !state.aiSessionId) return;
   state.aiSessionByConnection[state.aiConnectionId] = state.aiSessionId;
-  saveAiSessionMap();
+  await saveAiSessionMap();
 }
 
-function rememberLegacyAiSession() {
-  if (!state.aiConnectionId || !state.aiSessionId) return;
-  if (state.aiSessionByConnection[state.aiConnectionId]) return;
-  state.aiSessionByConnection[state.aiConnectionId] = state.aiSessionId;
-  saveAiSessionMap();
-}
-
-function forgetAiSessionForConnection(connectionId) {
+async function forgetAiSessionForConnection(connectionId) {
   if (!connectionId) return;
   delete state.aiSessionByConnection[connectionId];
-  saveAiSessionMap();
+  await saveAiSessionMap();
 }
 
 function setCurrentAiSession(sessionId) {
   state.aiSessionId = sessionId || null;
-  if (state.aiSessionId) {
-    sessionStorage.setItem(AI_SESSION_KEY, state.aiSessionId);
-  } else {
-    sessionStorage.removeItem(AI_SESSION_KEY);
-  }
 }
 
 function renderAiConnectionOptions() {
@@ -235,14 +261,12 @@ function renderAiConnectionOptions() {
     const active = activeConnection();
     const preferredId = previous && options.some((connection) => connection.id === previous)
       ? previous
-      : !state.aiSessionId && active && options.some((connection) => connection.id === active.id)
+      : active && options.some((connection) => connection.id === active.id)
         ? active.id
         : options[0].id;
     state.aiConnectionId = preferredId;
     els.aiConnectionSelect.value = preferredId;
-    if (!state.aiSessionId && state.aiSessionByConnection[preferredId]) {
-      setCurrentAiSession(state.aiSessionByConnection[preferredId]);
-    }
+    setCurrentAiSession(state.aiSessionByConnection[preferredId] || null);
   }
 
   updateAiControls();
@@ -329,18 +353,19 @@ function renderMarkdown(text) {
       continue;
     }
 
-    const fenceMatch = line.match(/^\s*```([A-Za-z0-9_-]*)\s*$/);
+    const fenceMatch = line.match(/^\s*(```|~~~)([A-Za-z0-9_-]*)\s*$/);
     if (fenceMatch) {
+      const fence = fenceMatch[1];
       const codeLines = [];
       index += 1;
-      while (index < lines.length && !lines[index].match(/^\s*```\s*$/)) {
+      while (index < lines.length && !lines[index].match(new RegExp(`^\\s*${fence}\\s*$`))) {
         codeLines.push(lines[index]);
         index += 1;
       }
       if (index < lines.length) index += 1;
       const pre = document.createElement("pre");
       const code = document.createElement("code");
-      if (fenceMatch[1]) code.className = `language-${fenceMatch[1]}`;
+      if (fenceMatch[2]) code.className = `language-${fenceMatch[2]}`;
       code.textContent = codeLines.join("\n");
       pre.appendChild(code);
       fragment.appendChild(pre);
@@ -354,12 +379,19 @@ function renderMarkdown(text) {
       continue;
     }
 
-    const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
+    const headingMatch = line.match(/^(#{1,6})\s*(.+)$/);
     if (headingMatch) {
       const heading = document.createElement(`h${Math.min(headingMatch[1].length, 4)}`);
       appendInlineMarkdown(heading, headingMatch[2].trim());
       fragment.appendChild(heading);
       index += 1;
+      continue;
+    }
+
+    if (/^\s*<\/?(details|summary)\b/i.test(line)) {
+      const { element, nextIndex } = renderMarkdownHtmlBlock(lines, index);
+      fragment.appendChild(element);
+      index = nextIndex;
       continue;
     }
 
@@ -390,8 +422,7 @@ function renderMarkdown(text) {
       while (index < lines.length) {
         const itemMatch = lines[index].match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/);
         if (!itemMatch || /\d+\./.test(itemMatch[2]) !== ordered) break;
-        const item = document.createElement("li");
-        appendInlineMarkdown(item, itemMatch[3].trim());
+        const item = renderMarkdownListItem(itemMatch[3].trim());
         list.appendChild(item);
         index += 1;
       }
@@ -414,28 +445,63 @@ function renderMarkdown(text) {
 
 function isMarkdownBlockStart(lines, index) {
   const line = lines[index] || "";
-  return /^\s*```/.test(line)
-    || /^(#{1,4})\s+/.test(line)
+  return /^\s*(```|~~~)/.test(line)
+    || /^(#{1,6})\s*.+/.test(line)
     || /^\s*(-{3,}|\*{3,})\s*$/.test(line)
+    || /^\s*<\/?(details|summary)\b/i.test(line)
     || /^\s*>\s?/.test(line)
     || /^(\s*)([-*+]|\d+\.)\s+/.test(line)
     || isMarkdownTable(lines, index);
 }
 
+function renderMarkdownListItem(text) {
+  const item = document.createElement("li");
+  const taskMatch = text.match(/^\[([ xX])\]\s+(.+)$/);
+  if (!taskMatch) {
+    appendInlineMarkdown(item, text);
+    return item;
+  }
+
+  item.className = "markdown-task-item";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.disabled = true;
+  checkbox.checked = taskMatch[1].toLowerCase() === "x";
+  const label = document.createElement("span");
+  appendInlineMarkdown(label, taskMatch[2].trim());
+  item.append(checkbox, label);
+  return item;
+}
+
 function appendInlineMarkdown(parent, text) {
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\((https?:\/\/[^\s)]+)\))/g;
+  const pattern = /(!\[[^\]\n]*\]\((https?:\/\/[^\s)]+)\)|`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|\*[^*\n]+\*|\[[^\]\n]+\]\((https?:\/\/[^\s)]+)\))/g;
   let cursor = 0;
   for (const match of text.matchAll(pattern)) {
     appendTextWithBreaks(parent, text.slice(cursor, match.index));
     const token = match[0];
-    if (token.startsWith("`")) {
+    if (token.startsWith("![")) {
+      const imageMatch = token.match(/^!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)$/);
+      if (imageMatch) {
+        const image = document.createElement("img");
+        image.src = imageMatch[2];
+        image.alt = imageMatch[1] || "";
+        image.loading = "lazy";
+        parent.appendChild(image);
+      } else {
+        appendTextWithBreaks(parent, token);
+      }
+    } else if (token.startsWith("`")) {
       const code = document.createElement("code");
       code.textContent = token.slice(1, -1);
       parent.appendChild(code);
-    } else if (token.startsWith("**")) {
+    } else if (token.startsWith("**") || token.startsWith("__")) {
       const strong = document.createElement("strong");
       strong.textContent = token.slice(2, -2);
       parent.appendChild(strong);
+    } else if (token.startsWith("~~")) {
+      const deleted = document.createElement("del");
+      deleted.textContent = token.slice(2, -2);
+      parent.appendChild(deleted);
     } else if (token.startsWith("*")) {
       const emphasis = document.createElement("em");
       emphasis.textContent = token.slice(1, -1);
@@ -456,6 +522,46 @@ function appendInlineMarkdown(parent, text) {
     cursor = Number(match.index) + token.length;
   }
   appendTextWithBreaks(parent, text.slice(cursor));
+}
+
+function renderMarkdownHtmlBlock(lines, index) {
+  const collected = [];
+  while (index < lines.length) {
+    collected.push(lines[index]);
+    const line = lines[index];
+    index += 1;
+    if (/<\/details>/i.test(line)) break;
+    if (!/<details\b/i.test(collected[0]) && !/<summary\b/i.test(line)) break;
+  }
+
+  const details = document.createElement("details");
+  details.className = "markdown-details";
+  details.open = true;
+  const summary = document.createElement("summary");
+  const summaryText = stripMarkdownHtmlTags(
+    collected.find((line) => /<summary\b/i.test(line)) || "补充内容",
+  ).trim() || "补充内容";
+  summary.textContent = summaryText;
+  details.appendChild(summary);
+
+  const bodyText = collected
+    .map(stripMarkdownHtmlTags)
+    .filter((line) => line.trim() && line.trim() !== summaryText)
+    .join("\n");
+  const body = document.createElement("div");
+  body.appendChild(renderMarkdown(bodyText));
+  details.appendChild(body);
+  return { element: details, nextIndex: index };
+}
+
+function stripMarkdownHtmlTags(line = "") {
+  return line
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/?(details|summary|p|div|span|strong|em|b|i|ul|ol|li)\b[^>]*>/gi, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&");
 }
 
 function appendTextWithBreaks(parent, text) {
@@ -567,25 +673,70 @@ async function loadAiConfig() {
 }
 
 async function restoreAiSessionMessages() {
+  const requestId = ++state.aiRestoreRequestId;
+  const connectionId = state.aiConnectionId;
   if (!state.aiSessionId) {
-    state.aiMessages = [];
-    renderAiMessages();
+    await lookupAiSessionForCurrentConnection(requestId, connectionId);
     return;
   }
   try {
     const data = await api(`/api/ai/sessions/${encodeURIComponent(state.aiSessionId)}/messages`);
+    if (requestId !== state.aiRestoreRequestId || connectionId !== state.aiConnectionId) return;
+    const connection = selectedAiConnection();
+    if (connection && data.connection_name && data.connection_name !== connection.name) {
+      await forgetAiSessionForConnection(state.aiConnectionId);
+      setCurrentAiSession(null);
+      await lookupAiSessionForCurrentConnection(requestId, connectionId);
+      return;
+    }
     state.aiMessages = Array.isArray(data.messages) ? data.messages : [];
     renderAiMessages();
   } catch (error) {
-    forgetAiSessionForConnection(state.aiConnectionId);
+    if (requestId !== state.aiRestoreRequestId || connectionId !== state.aiConnectionId) return;
+    await forgetAiSessionForConnection(state.aiConnectionId);
     setCurrentAiSession(null);
+    await lookupAiSessionForCurrentConnection(requestId, connectionId);
+  }
+}
+
+async function lookupAiSessionForCurrentConnection(requestId = ++state.aiRestoreRequestId, connectionId = state.aiConnectionId) {
+  const connection = selectedAiConnection();
+  if (!connection || !connectionId) {
+    if (requestId !== state.aiRestoreRequestId || connectionId !== state.aiConnectionId) return;
+    state.aiMessages = [];
+    renderAiMessages();
+    return;
+  }
+
+  try {
+    const data = await api("/api/ai/sessions/lookup", {
+      method: "POST",
+      body: JSON.stringify({
+        connection: connectionPayload(connection),
+        connection_name: connection.name,
+      }),
+    });
+    if (requestId !== state.aiRestoreRequestId || connectionId !== state.aiConnectionId) return;
+    const session = data.session;
+    if (!session?.session_id) {
+      state.aiMessages = [];
+      renderAiMessages();
+      return;
+    }
+    setCurrentAiSession(session.session_id);
+    state.aiSessionByConnection[connectionId] = state.aiSessionId;
+    await saveAiSessionMap();
+    state.aiMessages = Array.isArray(session.messages) ? session.messages : [];
+    renderAiMessages();
+  } catch (error) {
+    if (requestId !== state.aiRestoreRequestId || connectionId !== state.aiConnectionId) return;
     state.aiMessages = [];
     renderAiMessages();
   }
 }
 
 async function switchAiConnection(connectionId) {
-  rememberCurrentAiSession();
+  await rememberCurrentAiSession();
   state.aiConnectionId = connectionId || null;
   const sessionId = state.aiConnectionId ? state.aiSessionByConnection[state.aiConnectionId] : null;
   setCurrentAiSession(sessionId || null);
@@ -612,13 +763,13 @@ async function ensureAiSession() {
   setCurrentAiSession(data.session_id);
   if (state.aiConnectionId) {
     state.aiSessionByConnection[state.aiConnectionId] = state.aiSessionId;
-    saveAiSessionMap();
+    await saveAiSessionMap();
   }
   return state.aiSessionId;
 }
 
-function resetAiSession({ keepMessages = false } = {}) {
-  forgetAiSessionForConnection(state.aiConnectionId);
+async function resetAiSession({ keepMessages = false } = {}) {
+  await forgetAiSessionForConnection(state.aiConnectionId);
   setCurrentAiSession(null);
   showAiSql("");
   if (!keepMessages) {
@@ -661,7 +812,7 @@ async function submitAiMessage(event) {
     state.aiMessages.pop();
     state.aiMessages.push({ role: "assistant", content: error.message });
     if (/session/i.test(error.message) || /会话/.test(error.message)) {
-      resetAiSession({ keepMessages: true });
+      await resetAiSession({ keepMessages: true });
     }
   } finally {
     state.aiBusy = false;
@@ -972,7 +1123,7 @@ function updateConnectionStatusSummary() {
   els.redisStatusLabel.textContent = `Redis ${redisCount}`;
 }
 
-function loadStoredConnections() {
+function loadLegacyStoredConnections() {
   const raw = localStorage.getItem(STORAGE_KEY);
   if (!raw) return [];
 
@@ -991,9 +1142,51 @@ function loadStoredConnections() {
   }
 }
 
-function saveStoredConnections() {
+function normalizeStoredConnections(connections) {
+  if (!Array.isArray(connections)) return [];
+  return connections.map((connection) => ({
+    ...connection,
+    kind: connection.kind || "sql",
+    redisEnabled: Boolean(connection.redisEnabled),
+    redisConnected: false,
+    sqlConnected: false,
+  }));
+}
+
+function serializableConnections() {
   const persisted = state.connections.map(({ tables, loadingTables, sqlConnected, redisConnected, redisError, ...connection }) => connection);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(persisted));
+  return persisted;
+}
+
+async function loadStoredConnections() {
+  try {
+    const data = await api("/api/connections");
+    const serverConnections = normalizeStoredConnections(data.connections);
+    if (serverConnections.length > 0) {
+      localStorage.removeItem(STORAGE_KEY);
+      return serverConnections;
+    }
+
+    const legacyConnections = loadLegacyStoredConnections();
+    if (legacyConnections.length > 0) {
+      state.connections = legacyConnections;
+      await saveStoredConnections();
+      localStorage.removeItem(STORAGE_KEY);
+      return legacyConnections;
+    }
+    return [];
+  } catch (error) {
+    setMessage(`读取本地连接配置失败：${error.message}`, true);
+    return loadLegacyStoredConnections();
+  }
+}
+
+async function saveStoredConnections() {
+  const persisted = serializableConnections();
+  await api("/api/connections", {
+    method: "PUT",
+    body: JSON.stringify({ connections: persisted }),
+  });
 }
 
 function renderConnections() {
@@ -1284,7 +1477,7 @@ function closeTab(id) {
   }
 }
 
-function addConnection(event) {
+async function addConnection(event) {
   event.preventDefault();
   const name = els.connectionName.value.trim();
   const kind = els.driverSelect.value === "redis" ? "redis" : "sql";
@@ -1334,11 +1527,15 @@ function addConnection(event) {
     });
   }
 
-  saveStoredConnections();
-  renderConnections();
-  state.editingConnectionId = null;
-  closeConnectionModal();
-  setMessage("连接已保存，点击连接名称后才会连接数据库");
+  try {
+    await saveStoredConnections();
+    renderConnections();
+    state.editingConnectionId = null;
+    closeConnectionModal();
+    setMessage("连接已保存到本地配置，启动后会自动加载");
+  } catch (error) {
+    setMessage(`保存连接失败：${error.message}`, true);
+  }
 }
 
 function editConnection(id) {
@@ -1377,7 +1574,7 @@ async function deleteConnection(id) {
     showAiSql("");
     renderAiMessages();
   }
-  forgetAiSessionForConnection(id);
+  await forgetAiSessionForConnection(id);
   state.connections = state.connections.filter((connection) => connection.id !== id);
   state.tabs = state.tabs.filter((tab) => tab.connectionId !== id);
   if (state.activeConnectionId === id) {
@@ -1398,11 +1595,15 @@ async function deleteConnection(id) {
       renderConnections();
       renderGrid([], [], false);
       els.viewTitle.textContent = "选择连接";
-      els.viewMeta.textContent = "本地连接已显示，点击后才连接数据库";
+      els.viewMeta.textContent = "已加载本地配置连接，点击后才连接数据库";
     }
   }
-  saveStoredConnections();
-  renderConnections();
+  try {
+    await saveStoredConnections();
+    renderConnections();
+  } catch (error) {
+    setMessage(`删除连接后保存配置失败：${error.message}`, true);
+  }
 }
 
 async function useConnection(id) {
@@ -2445,7 +2646,9 @@ els.cancelDeleteButton.addEventListener("click", closeDeleteConnectionModal);
 els.confirmDeleteButton.addEventListener("click", confirmDeleteConnection);
 els.aiForm.addEventListener("submit", submitAiMessage);
 els.aiUseSqlButton.addEventListener("click", useAiSqlInEditor);
-els.aiResetButton.addEventListener("click", () => resetAiSession());
+els.aiResetButton.addEventListener("click", () => {
+  resetAiSession().catch((error) => setMessage(`重置 AI 会话失败：${error.message}`, true));
+});
 els.aiCloseButton.addEventListener("click", () => setAiPanelCollapsed(true));
 els.aiOpenButton.addEventListener("click", () => setAiPanelCollapsed(false));
 els.aiModelSelect.addEventListener("change", () => {
@@ -2475,9 +2678,11 @@ document.querySelectorAll('input[name="connectionMode"]').forEach((input) => {
 });
 
 async function start() {
+  sessionStorage.removeItem("sqlRedisVisualAiSessionId");
   setupSidebarResize();
   setupAiPanelResize();
-  state.connections = loadStoredConnections();
+  state.connections = await loadStoredConnections();
+  await loadAiSessionLinks();
   els.redisUrl.value = DEFAULT_REDIS_URL;
   setRedisEnabled(false);
   els.limitInput.value = QUERY_ROW_LIMIT;
@@ -2485,11 +2690,10 @@ async function start() {
   setPendingStatus();
   updateCommitButton();
   els.viewTitle.textContent = state.connections.length > 0 ? "选择连接" : "添加连接";
-  els.viewMeta.textContent = "连接信息保存在浏览器本地，不会自动连接数据库";
+  els.viewMeta.textContent = "连接信息保存在后端本地配置，不会自动连接数据库";
   setMessage("添加或点击左侧连接后开始浏览数据");
   renderAiMessages();
   await loadAiConfig();
-  rememberLegacyAiSession();
   await restoreAiSessionMessages();
 }
 
