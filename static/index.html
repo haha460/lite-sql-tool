@@ -53,7 +53,10 @@
       <nav id="tabBar" class="tab-bar"></nav>
 
       <section class="query-panel">
-        <textarea id="sqlEditor" spellcheck="false">select * from sqlite_master</textarea>
+        <div class="sql-editor-wrap">
+          <textarea id="sqlEditor" spellcheck="false" aria-autocomplete="list" aria-controls="sqlAutocomplete" aria-expanded="false">select * from sqlite_master</textarea>
+          <div id="sqlAutocomplete" class="sql-autocomplete hidden" role="listbox"></div>
+        </div>
         <div class="query-actions">
           <input id="limitInput" type="number" min="1" max="1000" value="100" title="SQL 查询默认限制行数">
           <button id="runQueryButton" type="button">执行 SQL</button>
@@ -168,6 +171,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=ai-session-links-20260629-1"></script>
+    <script src="/static/app.js?v=sql-autocomplete-20260629-1"></script>
   </body>
 </html>

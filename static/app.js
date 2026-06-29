@@ -36,6 +36,13 @@ const state = {
   aiModelId: sessionStorage.getItem("sqlRedisVisualAiModelId") || null,
   aiPanelCollapsed: localStorage.getItem("sqlRedisVisualAiPanelCollapsed") === "1",
   aiRestoreRequestId: 0,
+  sqlAutocomplete: {
+    visible: false,
+    items: [],
+    selectedIndex: 0,
+    tokenStart: 0,
+    tokenEnd: 0,
+  },
 };
 
 const STORAGE_KEY = "sqlRedisVisualConnections";
@@ -52,6 +59,75 @@ const VIRTUAL_ROW_HEIGHT = 38;
 const VIRTUAL_OVERSCAN_ROWS = 10;
 const VIRTUAL_BOTTOM_PADDING = 72;
 const LOAD_MORE_BOTTOM_THRESHOLD = 12;
+const SQL_AUTOCOMPLETE_LIMIT = 80;
+const SQL_AUTOCOMPLETE_KEYWORDS = [
+  "select",
+  "from",
+  "where",
+  "join",
+  "left join",
+  "right join",
+  "inner join",
+  "outer join",
+  "on",
+  "and",
+  "or",
+  "not",
+  "in",
+  "is",
+  "null",
+  "like",
+  "between",
+  "group by",
+  "order by",
+  "having",
+  "limit",
+  "offset",
+  "distinct",
+  "case",
+  "when",
+  "then",
+  "else",
+  "end",
+  "as",
+  "with",
+  "union",
+  "union all",
+  "exists",
+  "desc",
+  "asc",
+];
+const SQL_AUTOCOMPLETE_FUNCTIONS = [
+  "count(*)",
+  "sum()",
+  "avg()",
+  "min()",
+  "max()",
+  "coalesce()",
+  "date()",
+  "datetime()",
+  "lower()",
+  "upper()",
+  "substr()",
+  "round()",
+];
+const SQL_RESERVED_WORDS = new Set([
+  ...SQL_AUTOCOMPLETE_KEYWORDS.flatMap((keyword) => keyword.split(/\s+/)),
+  "by",
+  "cross",
+  "full",
+  "natural",
+  "using",
+  "window",
+  "partition",
+  "over",
+  "create",
+  "alter",
+  "drop",
+  "insert",
+  "update",
+  "delete",
+]);
 
 state.aiSessionByConnection = loadAiSessionMap();
 
@@ -99,6 +175,7 @@ const els = {
   commitButton: document.querySelector("#commitButton"),
   refreshButton: document.querySelector("#refreshButton"),
   sqlEditor: document.querySelector("#sqlEditor"),
+  sqlAutocomplete: document.querySelector("#sqlAutocomplete"),
   limitInput: document.querySelector("#limitInput"),
   runQueryButton: document.querySelector("#runQueryButton"),
   message: document.querySelector("#message"),
@@ -825,7 +902,394 @@ function useAiSqlInEditor() {
   if (!state.aiLastSql) return;
   els.sqlEditor.value = state.aiLastSql;
   els.sqlEditor.focus();
+  hideSqlAutocomplete();
   setMessage("AI 生成的 SQL 已放入编辑器");
+}
+
+function setupSqlAutocomplete() {
+  els.sqlEditor.addEventListener("input", () => {
+    window.requestAnimationFrame(() => updateSqlAutocomplete());
+  });
+  els.sqlEditor.addEventListener("keydown", handleSqlAutocompleteKeyDown);
+  els.sqlEditor.addEventListener("click", () => updateSqlAutocomplete());
+  els.sqlEditor.addEventListener("scroll", hideSqlAutocomplete);
+  els.sqlEditor.addEventListener("blur", () => {
+    window.setTimeout(() => {
+      if (!els.sqlAutocomplete.matches(":hover")) {
+        hideSqlAutocomplete();
+      }
+    }, 120);
+  });
+  els.sqlAutocomplete.addEventListener("mousedown", (event) => event.preventDefault());
+  document.addEventListener("click", (event) => {
+    if (event.target === els.sqlEditor || els.sqlAutocomplete.contains(event.target)) return;
+    hideSqlAutocomplete();
+  });
+}
+
+function handleSqlAutocompleteKeyDown(event) {
+  if ((event.ctrlKey || event.metaKey) && event.code === "Space") {
+    event.preventDefault();
+    updateSqlAutocomplete({ manual: true });
+    return;
+  }
+
+  if (!state.sqlAutocomplete.visible) return;
+
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    selectSqlAutocompleteIndex(state.sqlAutocomplete.selectedIndex + 1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    selectSqlAutocompleteIndex(state.sqlAutocomplete.selectedIndex - 1);
+  } else if (event.key === "Enter" || event.key === "Tab") {
+    event.preventDefault();
+    acceptSqlAutocompleteItem(state.sqlAutocomplete.selectedIndex);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    hideSqlAutocomplete();
+  }
+}
+
+function updateSqlAutocomplete(options = {}) {
+  const context = sqlAutocompleteContext();
+  if (!context) {
+    hideSqlAutocomplete();
+    return;
+  }
+
+  const shouldOpen = options.manual || context.hasQualifier || context.query.length > 0;
+  if (!shouldOpen) {
+    hideSqlAutocomplete();
+    return;
+  }
+
+  const items = rankedSqlAutocompleteItems(context);
+  if (items.length === 0) {
+    hideSqlAutocomplete();
+    return;
+  }
+
+  state.sqlAutocomplete.visible = true;
+  state.sqlAutocomplete.items = items;
+  state.sqlAutocomplete.selectedIndex = 0;
+  state.sqlAutocomplete.tokenStart = context.tokenStart;
+  state.sqlAutocomplete.tokenEnd = context.tokenEnd;
+  renderSqlAutocomplete();
+}
+
+function sqlAutocompleteContext() {
+  const editor = els.sqlEditor;
+  const value = editor.value || "";
+  const selectionStart = editor.selectionStart ?? 0;
+  const selectionEnd = editor.selectionEnd ?? selectionStart;
+
+  if (selectionStart !== selectionEnd) {
+    return {
+      query: stripSqlIdentifierQuotes(value.slice(selectionStart, selectionEnd)),
+      qualifier: "",
+      hasQualifier: false,
+      tokenStart: selectionStart,
+      tokenEnd: selectionEnd,
+      tablePosition: isSqlTableCompletionPosition(value, selectionStart),
+      value,
+      cursor: selectionStart,
+    };
+  }
+
+  let tokenStart = selectionStart;
+  while (tokenStart > 0 && isSqlCompletionTokenChar(value[tokenStart - 1])) {
+    tokenStart -= 1;
+  }
+
+  const rawToken = value.slice(tokenStart, selectionStart);
+  const dotIndex = rawToken.lastIndexOf(".");
+  const hasQualifier = dotIndex >= 0;
+  const queryStart = hasQualifier ? tokenStart + dotIndex + 1 : tokenStart;
+  const qualifier = hasQualifier ? stripSqlIdentifierQuotes(rawToken.slice(0, dotIndex)) : "";
+  const query = stripSqlIdentifierQuotes(value.slice(queryStart, selectionStart));
+
+  return {
+    query,
+    qualifier,
+    hasQualifier,
+    tokenStart: queryStart,
+    tokenEnd: selectionEnd,
+    tablePosition: isSqlTableCompletionPosition(value, queryStart),
+    value,
+    cursor: selectionStart,
+  };
+}
+
+function isSqlCompletionTokenChar(char) {
+  return /[\p{L}\p{N}_.$"`]/u.test(char || "");
+}
+
+function isSqlTableCompletionPosition(value, tokenStart) {
+  const before = value.slice(0, tokenStart).replace(/--.*$/gm, " ").replace(/\s+/g, " ").toLowerCase();
+  return /(?:\bfrom|\bjoin|\bupdate|\binto|,\s*)\s*$/.test(before);
+}
+
+function rankedSqlAutocompleteItems(context) {
+  const query = context.query.toLowerCase();
+  const candidates = sqlAutocompleteCandidates(context);
+  const seen = new Set();
+
+  return candidates
+    .map((item) => {
+      const key = `${item.kind}:${item.value}:${item.detail || ""}`;
+      if (seen.has(key)) return null;
+      seen.add(key);
+      const label = item.value.toLowerCase();
+      const detail = String(item.detail || "").toLowerCase();
+      let score = item.priority || 0;
+
+      if (query) {
+        if (label === query) score += 1000;
+        else if (label.startsWith(query)) score += 800;
+        else if (label.includes(query)) score += 420;
+        else if (detail.includes(query)) score += 180;
+        else return null;
+      } else {
+        score += 100;
+      }
+
+      if (context.tablePosition && item.kind === "表") score += 220;
+      if (context.hasQualifier && item.kind === "字段") score += 260;
+      return { ...item, score };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score || left.value.localeCompare(right.value, "zh-CN"))
+    .slice(0, SQL_AUTOCOMPLETE_LIMIT);
+}
+
+function sqlAutocompleteCandidates(context) {
+  if (context.hasQualifier) {
+    return sqlColumnCompletionItemsForQualifier(context);
+  }
+
+  const candidates = [];
+  if (!context.tablePosition) {
+    SQL_AUTOCOMPLETE_KEYWORDS.forEach((keyword) => {
+      candidates.push(sqlCompletionItem("关键字", keyword, "SQL 关键字", { appendSpace: true, priority: 100 }));
+    });
+    SQL_AUTOCOMPLETE_FUNCTIONS.forEach((fn) => {
+      const cursorOffset = /\(\)$/.test(fn) ? fn.length - 1 : null;
+      candidates.push(sqlCompletionItem("函数", fn, "SQL 函数", { cursorOffset, priority: 90 }));
+    });
+  }
+
+  sqlTableCompletionItems().forEach((item) => candidates.push(item));
+
+  if (!context.tablePosition) {
+    sqlColumnCompletionItems().forEach((item) => candidates.push(item));
+  }
+
+  return candidates;
+}
+
+function sqlColumnCompletionItemsForQualifier(context) {
+  const table = resolveSqlQualifier(context.qualifier, context.value, context.cursor);
+  if (!table) return [];
+  return (table.columns || []).map((column) => sqlCompletionItem(
+    "字段",
+    column.name,
+    `${table.name} · ${column.type || "字段"}`,
+    {
+      insertText: sqlIdentifierInsertText(column.name),
+      priority: column.primary_key ? 130 : 110,
+    },
+  ));
+}
+
+function sqlTableCompletionItems() {
+  return sqlAvailableTables().map((table) => sqlCompletionItem(
+    "表",
+    table.name,
+    table.columns?.length ? `${table.columns.length} 个字段` : "数据表",
+    {
+      insertText: sqlIdentifierInsertText(table.name),
+      appendSpace: true,
+      priority: state.activeTable?.name === table.name ? 120 : 80,
+    },
+  ));
+}
+
+function sqlColumnCompletionItems() {
+  const items = [];
+  const tables = sqlAvailableTables();
+  const active = state.activeTable;
+  if (active) {
+    (active.columns || []).forEach((column) => {
+      items.push(sqlCompletionItem(
+        "字段",
+        column.name,
+        `${active.name} · ${column.type || "字段"}`,
+        {
+          insertText: sqlIdentifierInsertText(column.name),
+          priority: column.primary_key ? 95 : 80,
+        },
+      ));
+    });
+  }
+  tables.forEach((table) => {
+    if (active && table.name === active.name) return;
+    (table.columns || []).forEach((column) => {
+      items.push(sqlCompletionItem(
+        "字段",
+        column.name,
+        `${table.name} · ${column.type || "字段"}`,
+        {
+          insertText: sqlIdentifierInsertText(column.name),
+          priority: column.primary_key ? 55 : 40,
+        },
+      ));
+    });
+  });
+  return items;
+}
+
+function sqlCompletionItem(kind, value, detail, options = {}) {
+  return {
+    kind,
+    value,
+    detail,
+    insertText: options.insertText || value,
+    appendSpace: Boolean(options.appendSpace),
+    cursorOffset: options.cursorOffset,
+    priority: options.priority || 0,
+  };
+}
+
+function sqlAvailableTables() {
+  const connection = activeConnection();
+  return Array.isArray(connection?.tables) ? connection.tables : [];
+}
+
+function resolveSqlQualifier(qualifier, sql, cursor) {
+  const normalized = stripSqlIdentifierQuotes(qualifier).split(".").pop().toLowerCase();
+  if (!normalized) return null;
+
+  const references = sqlTableReferences(sql, cursor);
+  if (references.has(normalized)) return references.get(normalized);
+
+  return sqlAvailableTables().find((table) => table.name.toLowerCase() === normalized) || null;
+}
+
+function sqlTableReferences(sql, cursor) {
+  const tables = new Map();
+  const tableByName = new Map(sqlAvailableTables().map((table) => [table.name.toLowerCase(), table]));
+  const source = String(sql || "").slice(0, cursor).replace(/[`"]/g, "");
+  const pattern = /\b(?:from|join)\s+([A-Za-z0-9_.]+)(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?/gi;
+  for (const match of source.matchAll(pattern)) {
+    const tableName = match[1].split(".").pop().toLowerCase();
+    const table = tableByName.get(tableName);
+    if (!table) continue;
+    tables.set(table.name.toLowerCase(), table);
+    const alias = (match[2] || "").toLowerCase();
+    if (alias && !SQL_RESERVED_WORDS.has(alias)) {
+      tables.set(alias, table);
+    }
+  }
+  return tables;
+}
+
+function stripSqlIdentifierQuotes(value) {
+  return String(value || "").replace(/^[`"]+|[`"]+$/g, "");
+}
+
+function sqlIdentifierInsertText(value) {
+  const identifier = String(value || "");
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier) && !SQL_RESERVED_WORDS.has(identifier.toLowerCase())) {
+    return identifier;
+  }
+  const quote = sqlIdentifierQuote();
+  return `${quote}${identifier.replaceAll(quote, `${quote}${quote}`)}${quote}`;
+}
+
+function sqlIdentifierQuote() {
+  const sqlUrl = activeConnection()?.sqlUrl || "";
+  return sqlUrl.startsWith("mysql") || sqlUrl.includes("mysql+") ? "`" : "\"";
+}
+
+function renderSqlAutocomplete() {
+  els.sqlAutocomplete.innerHTML = "";
+  state.sqlAutocomplete.items.forEach((item, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = `sqlAutocompleteOption${index}`;
+    button.className = "sql-autocomplete-item";
+    button.classList.toggle("active", index === state.sqlAutocomplete.selectedIndex);
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", index === state.sqlAutocomplete.selectedIndex ? "true" : "false");
+
+    const kind = document.createElement("span");
+    kind.className = "sql-autocomplete-kind";
+    kind.textContent = item.kind;
+
+    const main = document.createElement("span");
+    main.className = "sql-autocomplete-main";
+    const value = document.createElement("span");
+    value.className = "sql-autocomplete-value";
+    value.textContent = item.value;
+    const detail = document.createElement("span");
+    detail.className = "sql-autocomplete-detail";
+    detail.textContent = item.detail || "";
+    main.append(value, detail);
+
+    button.append(kind, main);
+    button.addEventListener("click", () => acceptSqlAutocompleteItem(index));
+    els.sqlAutocomplete.appendChild(button);
+  });
+
+  els.sqlAutocomplete.classList.remove("hidden");
+  els.sqlEditor.setAttribute("aria-expanded", "true");
+  els.sqlEditor.setAttribute("aria-activedescendant", `sqlAutocompleteOption${state.sqlAutocomplete.selectedIndex}`);
+}
+
+function selectSqlAutocompleteIndex(index) {
+  if (state.sqlAutocomplete.items.length === 0) return;
+  const count = state.sqlAutocomplete.items.length;
+  state.sqlAutocomplete.selectedIndex = (index + count) % count;
+  Array.from(els.sqlAutocomplete.children).forEach((child, childIndex) => {
+    const active = childIndex === state.sqlAutocomplete.selectedIndex;
+    child.classList.toggle("active", active);
+    child.setAttribute("aria-selected", active ? "true" : "false");
+    if (active) child.scrollIntoView({ block: "nearest" });
+  });
+  els.sqlEditor.setAttribute("aria-activedescendant", `sqlAutocompleteOption${state.sqlAutocomplete.selectedIndex}`);
+}
+
+function acceptSqlAutocompleteItem(index) {
+  const item = state.sqlAutocomplete.items[index];
+  if (!item) return;
+
+  const editor = els.sqlEditor;
+  const before = editor.value.slice(0, state.sqlAutocomplete.tokenStart);
+  const after = editor.value.slice(state.sqlAutocomplete.tokenEnd);
+  let insertText = item.insertText || item.value;
+  const nextChar = after[0] || "";
+  if (item.appendSpace && !/[\s),;]/.test(nextChar)) {
+    insertText += " ";
+  }
+
+  editor.value = before + insertText + after;
+  const cursor = Number.isFinite(item.cursorOffset)
+    ? before.length + item.cursorOffset
+    : before.length + insertText.length;
+  editor.focus();
+  editor.setSelectionRange(cursor, cursor);
+  hideSqlAutocomplete();
+}
+
+function hideSqlAutocomplete() {
+  state.sqlAutocomplete.visible = false;
+  state.sqlAutocomplete.items = [];
+  state.sqlAutocomplete.selectedIndex = 0;
+  els.sqlAutocomplete.classList.add("hidden");
+  els.sqlAutocomplete.innerHTML = "";
+  els.sqlEditor.setAttribute("aria-expanded", "false");
+  els.sqlEditor.removeAttribute("aria-activedescendant");
 }
 
 function loadColumnWidths() {
@@ -1438,6 +1902,7 @@ async function switchTab(id) {
   const tab = state.tabs.find((item) => item.id === id);
   if (!tab) return;
 
+  hideSqlAutocomplete();
   state.activeTabId = id;
   state.activeConnectionId = tab.connectionId;
   state.activeTable = tab.table;
@@ -1607,6 +2072,7 @@ async function deleteConnection(id) {
 }
 
 async function useConnection(id) {
+  hideSqlAutocomplete();
   state.activeConnectionId = id;
   state.activeTable = null;
   state.activeRows = [];
@@ -2681,6 +3147,7 @@ async function start() {
   sessionStorage.removeItem("sqlRedisVisualAiSessionId");
   setupSidebarResize();
   setupAiPanelResize();
+  setupSqlAutocomplete();
   state.connections = await loadStoredConnections();
   await loadAiSessionLinks();
   els.redisUrl.value = DEFAULT_REDIS_URL;
