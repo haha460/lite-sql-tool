@@ -96,7 +96,7 @@ export AI_API_KEY="your-api-key"
 export AI_MODEL="your-model-name"
 ```
 
-AI 会话默认保存在后端内存中。配置 `AI_SESSION_DATABASE_URL` 后，会话、消息和关联的 OpenCode session id 会持久化到数据库，后端会自动创建 `ai_sessions` 表和更新时间索引；页面仍在 `sessionStorage` 记录当前会话 ID、连接映射和模型选择，刷新页面或后端重启后会自动尝试恢复历史消息。
+AI 会话默认保存在后端内存中。配置 `AI_SESSION_DATABASE_URL` 后，会话元数据和关联的 OpenCode session id 会持久化到 `ai_sessions`，每一轮用户问题和 AI 回复会以一行 turn 记录存到 `ai_session_turns`；页面仍在 `sessionStorage` 记录当前会话 ID、连接映射和模型选择，刷新页面或后端重启后会自动尝试恢复历史消息。旧版 `ai_sessions.messages` 中的历史消息会在启动时自动拆分迁移到 turn 表。
 
 本地 PostgreSQL 示例：
 
@@ -140,6 +140,12 @@ OpenCode 模式下，FastAPI 会把用户问题转交给 OpenCode Server。OpenC
 - `.opencode/tools/db_select.ts`：执行当前 AI session 下的只读 SQL
 
 OpenCode 工具只接收后端生成的 AI session id，并回调 `/api/ai/tool/schema` 和 `/api/ai/tool/select`；它不会直接接触前端保存的数据库连接密码。
+
+后端等待 OpenCode 回复时默认使用 OpenCode Server 的 `/event` SSE 事件流：先建立 SSE 订阅，再发送用户消息，收到当前 OpenCode session 的消息更新或空闲事件后再拉取最终消息。若当前 OpenCode Server 不支持 SSE 或连接中断，会自动回退到原来的消息轮询。需要临时禁用 SSE 时可设置：
+
+```bash
+export OPENCODE_RESPONSE_TRANSPORT=poll
+```
 
 ## 启动 Web 项目
 
@@ -201,6 +207,7 @@ OPENCODE_PROVIDER=huayan
 - `OPENCODE_HOST` / `OPENCODE_PORT`：控制 `scripts/start_opencode.py` 启动地址，默认 `127.0.0.1:4096`
 - `OPENCODE_BIN`：指定 OpenCode 可执行文件路径，默认查找 `opencode`
 - `OPENCODE_TIMEOUT`：后端等待 OpenCode 响应的超时时间，默认 120 秒
+- `OPENCODE_RESPONSE_TRANSPORT`：OpenCode 回复等待方式，默认 `sse`；设置为 `poll` / `polling` / `http` 可强制使用轮询
 - `OPENCODE_DIRECTORY`：传给 OpenCode Server 的项目目录，默认当前项目根目录
 - `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`：如果 OpenCode Server 开了基础认证，可以在后端请求时使用
 - `AI_SESSION_DATABASE_URL`：AI 会话记录存储数据库；未设置时使用后端内存

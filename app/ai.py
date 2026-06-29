@@ -5,6 +5,8 @@ import os
 import re
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -37,8 +39,23 @@ MAX_SCHEMA_TABLES = 80
 MAX_RESULT_CHARS = 14000
 MAX_HISTORY_MESSAGES = 12
 OPENCODE_POLL_INTERVAL_SECONDS = 0.8
+OPENCODE_SSE_CONNECT_TIMEOUT_SECONDS = 5
 OPENCODE_TRANSIENT_ERROR_GRACE_SECONDS = 20
 AI_SESSION_TABLE = "ai_sessions"
+AI_SESSION_TURN_TABLE = "ai_session_turns"
+OPENCODE_RESPONSE_EVENT_TYPES = {
+    "message.updated",
+    "session.idle",
+    "session.status",
+    "session.next.step.ended",
+    "session.next.text.ended",
+    "session.next.tool.success",
+    "session.next.tool.failed",
+}
+
+
+class OpenCodeSSEUnavailable(RuntimeError):
+    pass
 
 
 class ConnectionInfo(BaseModel):
@@ -119,9 +136,11 @@ def create_ai_session(payload: AiSessionRequest) -> dict[str, Any]:
 @router.get("/sessions/{session_id}/messages")
 def get_ai_messages(session_id: str) -> dict[str, Any]:
     session = require_session(session_id)
+    turns = messages_to_turns(session.messages)
     return {
         "session_id": session.id,
         "messages": session.messages,
+        "turns": turns,
         "connection_name": session.connection_name,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
@@ -152,7 +171,17 @@ async def chat_with_direct_model(
     model_config: dict[str, str],
 ) -> dict[str, Any]:
     schema = load_schema(session.connection)
-    session.messages.append({"role": "user", "content": user_message, "created_at": utc_now()})
+    turn_id = new_turn_id()
+    turn_index = next_session_turn_index(session)
+    session.messages.append(
+        {
+            "role": "user",
+            "content": user_message,
+            "turn_id": turn_id,
+            "turn_index": turn_index,
+            "created_at": utc_now(),
+        }
+    )
     session.updated_at = utc_now()
     save_session(session)
 
@@ -205,6 +234,8 @@ async def chat_with_direct_model(
         "model": model_config["model"],
         "sql": sql,
         "result": executed,
+        "turn_id": turn_id,
+        "turn_index": turn_index,
         "created_at": utc_now(),
     }
     session.messages.append(assistant_message)
@@ -358,14 +389,28 @@ async def chat_with_opencode(
     user_message: str,
     model_config: dict[str, str],
 ) -> dict[str, Any]:
-    session.messages.append({"role": "user", "content": user_message, "created_at": utc_now()})
+    turn_id = new_turn_id()
+    turn_index = next_session_turn_index(session)
+    session.messages.append(
+        {
+            "role": "user",
+            "content": user_message,
+            "turn_id": turn_id,
+            "turn_index": turn_index,
+            "created_at": utc_now(),
+        }
+    )
     session.updated_at = utc_now()
     save_session(session)
     opencode_session_id = await ensure_opencode_session(session)
     prompt = build_opencode_prompt(session.id, user_message)
-    await send_opencode_message(opencode_session_id, prompt, model_config)
-    response_data = await wait_for_opencode_response(opencode_session_id)
-    answer = extract_latest_opencode_assistant_text(response_data)
+    existing_message_ids = opencode_message_ids(await load_opencode_messages(opencode_session_id))
+    response_data = await wait_for_opencode_response_sse_first(
+        opencode_session_id,
+        lambda: send_opencode_message(opencode_session_id, prompt, model_config),
+        existing_message_ids,
+    )
+    answer = extract_latest_opencode_assistant_text(response_data, existing_message_ids)
     assistant_message = {
         "role": "assistant",
         "content": answer or "OpenCode did not return a text response.",
@@ -374,6 +419,8 @@ async def chat_with_opencode(
         "sql": None,
         "result": None,
         "agent_backend": "opencode",
+        "turn_id": turn_id,
+        "turn_index": turn_index,
         "created_at": utc_now(),
     }
     session.messages.append(assistant_message)
@@ -426,7 +473,252 @@ async def load_opencode_messages(opencode_session_id: str) -> dict[str, Any]:
     return await opencode_request("GET", f"/session/{opencode_session_id}/message", json_payload={})
 
 
-async def wait_for_opencode_response(opencode_session_id: str) -> dict[str, Any]:
+async def wait_for_opencode_response_sse_first(
+    opencode_session_id: str,
+    send_message: Callable[[], Awaitable[Any]],
+    existing_message_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    message_task: asyncio.Task[Any] | None = None
+
+    async def send_once() -> Any:
+        nonlocal message_task
+        if message_task is None:
+            message_task = asyncio.create_task(send_message())
+        return await message_task
+
+    if opencode_sse_enabled():
+        try:
+            return await wait_for_opencode_response_sse(opencode_session_id, send_once, existing_message_ids)
+        except OpenCodeSSEUnavailable:
+            pass
+    await send_once()
+    return await wait_for_opencode_response(opencode_session_id, existing_message_ids)
+
+
+async def wait_for_opencode_response_sse(
+    opencode_session_id: str,
+    send_message: Callable[[], Awaitable[Any]],
+    existing_message_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    base_url = os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:4096").rstrip("/")
+    timeout = float(os.getenv("OPENCODE_TIMEOUT", "120"))
+    deadline = asyncio.get_running_loop().time() + timeout
+    headers = {"Accept": "text/event-stream"}
+    username = os.getenv("OPENCODE_SERVER_USERNAME", "")
+    password = os.getenv("OPENCODE_SERVER_PASSWORD", "")
+    auth = (username, password) if username or password else None
+    last_data: dict[str, Any] = {}
+    send_task: asyncio.Task[Any] | None = None
+
+    client_timeout = httpx.Timeout(
+        timeout,
+        connect=OPENCODE_SSE_CONNECT_TIMEOUT_SECONDS,
+        read=None,
+        write=timeout,
+        pool=OPENCODE_SSE_CONNECT_TIMEOUT_SECONDS,
+    )
+    event_task: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        async with asyncio.timeout(timeout):
+            async with httpx.AsyncClient(timeout=client_timeout, auth=auth) as client:
+                async with client.stream(
+                    "GET",
+                    f"{base_url}/event",
+                    headers=headers,
+                    params=opencode_location_params(),
+                ) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "")
+                    if "text/event-stream" not in content_type.lower():
+                        raise OpenCodeSSEUnavailable(f"OpenCode /event did not return SSE: {content_type}")
+                    send_task = asyncio.create_task(send_message())
+                    event_stream = iter_sse_events(response)
+                    event_task = asyncio.create_task(anext(event_stream))
+
+                    while True:
+                        now = asyncio.get_running_loop().time()
+                        if now >= deadline:
+                            raise HTTPException(status_code=502, detail=f"OpenCode response timed out after {int(timeout)} seconds")
+
+                        wait_tasks = [event_task]
+                        if send_task is not None:
+                            wait_tasks.append(send_task)
+                        done, _ = await asyncio.wait(
+                            wait_tasks,
+                            timeout=deadline - now,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:
+                            raise HTTPException(status_code=502, detail=f"OpenCode response timed out after {int(timeout)} seconds")
+
+                        if send_task is not None and send_task in done:
+                            sent_data = await send_task
+                            send_task = None
+                            if has_completed_opencode_assistant_message(sent_data, existing_message_ids):
+                                return sent_data
+
+                        if event_task not in done:
+                            continue
+                        try:
+                            event = event_task.result()
+                        except StopAsyncIteration as exc:
+                            raise OpenCodeSSEUnavailable("OpenCode SSE stream closed") from exc
+                        event_task = asyncio.create_task(anext(event_stream))
+
+                        if not opencode_event_matches_session(event, opencode_session_id):
+                            continue
+                        if opencode_event_type(event) == "session.error":
+                            last_data = await load_opencode_messages(opencode_session_id)
+                            if has_completed_opencode_assistant_message(last_data, existing_message_ids):
+                                return last_data
+                            raise HTTPException(status_code=502, detail=f"OpenCode request failed: {opencode_event_error_text(event)}")
+                        if not opencode_event_can_complete_response(event):
+                            continue
+
+                        last_data = await load_opencode_messages(opencode_session_id)
+                        if has_completed_opencode_assistant_message(last_data, existing_message_ids):
+                            return last_data
+    except TimeoutError:
+        if send_task is not None:
+            if send_task.done():
+                send_task.result()
+            else:
+                send_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await send_task
+        if last_data and has_completed_opencode_assistant_message(last_data, existing_message_ids):
+            return last_data
+        raise HTTPException(status_code=502, detail=f"OpenCode response timed out after {int(timeout)} seconds")
+    except httpx.ConnectError as exc:
+        if send_task is not None and not send_task.done():
+            await send_task
+        raise OpenCodeSSEUnavailable(f"OpenCode SSE is not reachable at {base_url}") from exc
+    except httpx.HTTPStatusError as exc:
+        if send_task is not None and not send_task.done():
+            await send_task
+        raise OpenCodeSSEUnavailable(safe_response_detail(exc.response)) from exc
+    except httpx.HTTPError as exc:
+        if send_task is not None and not send_task.done():
+            await send_task
+        raise OpenCodeSSEUnavailable(str(exc)) from exc
+    finally:
+        if send_task is not None and not send_task.done():
+            await send_task
+        if event_task is not None and not event_task.done():
+            event_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await event_task
+
+    if last_data and has_completed_opencode_assistant_message(last_data, existing_message_ids):
+        return last_data
+    raise HTTPException(status_code=502, detail=f"OpenCode response timed out after {int(timeout)} seconds")
+
+
+async def iter_sse_events(response: httpx.Response):
+    data_lines: list[str] = []
+    event_name = ""
+    event_id = ""
+    async for line in response.aiter_lines():
+        if line == "":
+            event = build_sse_event(data_lines, event_name, event_id)
+            data_lines = []
+            event_name = ""
+            event_id = ""
+            if event is not None:
+                yield event
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "data":
+            data_lines.append(value)
+        elif field == "event":
+            event_name = value
+        elif field == "id":
+            event_id = value
+    event = build_sse_event(data_lines, event_name, event_id)
+    if event is not None:
+        yield event
+
+
+def build_sse_event(data_lines: list[str], event_name: str, event_id: str) -> dict[str, Any] | None:
+    if not data_lines:
+        return None
+    data = "\n".join(data_lines)
+    try:
+        parsed = json.loads(data)
+    except ValueError:
+        parsed = {"data": data}
+    if isinstance(parsed, dict):
+        if event_name:
+            parsed.setdefault("event", event_name)
+        if event_id:
+            parsed.setdefault("sse_id", event_id)
+        return parsed
+    return {"data": parsed, "event": event_name, "sse_id": event_id}
+
+
+def opencode_sse_enabled() -> bool:
+    value = os.getenv("OPENCODE_RESPONSE_TRANSPORT", "sse").strip().lower()
+    return value not in {"poll", "polling", "http", "none", "off", "false", "0"}
+
+
+def opencode_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    return payload if isinstance(payload, dict) else event
+
+
+def opencode_event_type(event: dict[str, Any]) -> str:
+    payload = opencode_event_payload(event)
+    return str(payload.get("type") or event.get("type") or event.get("event") or "")
+
+
+def opencode_event_properties(event: dict[str, Any]) -> dict[str, Any]:
+    payload = opencode_event_payload(event)
+    properties = payload.get("properties")
+    return properties if isinstance(properties, dict) else {}
+
+
+def opencode_event_matches_session(event: dict[str, Any], opencode_session_id: str) -> bool:
+    properties = opencode_event_properties(event)
+    session_id = properties.get("sessionID")
+    if session_id == opencode_session_id:
+        return True
+    info = properties.get("info")
+    if isinstance(info, dict) and info.get("sessionID") == opencode_session_id:
+        return True
+    part = properties.get("part")
+    return isinstance(part, dict) and part.get("sessionID") == opencode_session_id
+
+
+def opencode_event_can_complete_response(event: dict[str, Any]) -> bool:
+    event_type = opencode_event_type(event)
+    if event_type in OPENCODE_RESPONSE_EVENT_TYPES:
+        return True
+    return event_type.startswith("session.next.") and event_type.endswith(".ended")
+
+
+def opencode_event_error_text(event: dict[str, Any]) -> str:
+    error = opencode_event_properties(event).get("error")
+    if isinstance(error, dict):
+        data = error.get("data")
+        if isinstance(data, dict) and data.get("message"):
+            return str(data["message"])
+        if error.get("message"):
+            return str(error["message"])
+        if error.get("name"):
+            return str(error["name"])
+    if isinstance(error, str):
+        return error
+    return "OpenCode session error"
+
+
+async def wait_for_opencode_response(
+    opencode_session_id: str,
+    existing_message_ids: set[str] | None = None,
+) -> dict[str, Any]:
     timeout = float(os.getenv("OPENCODE_TIMEOUT", "120"))
     deadline = asyncio.get_running_loop().time() + timeout
     last_data: dict[str, Any] = {}
@@ -447,7 +739,7 @@ async def wait_for_opencode_response(opencode_session_id: str) -> dict[str, Any]
                 raise exc
             await asyncio.sleep(OPENCODE_POLL_INTERVAL_SECONDS)
             continue
-        if has_completed_opencode_assistant_message(last_data):
+        if has_completed_opencode_assistant_message(last_data, existing_message_ids):
             return last_data
         if now >= deadline:
             if last_error:
@@ -564,9 +856,15 @@ def extract_opencode_text(data: Any) -> str:
     return ""
 
 
-def extract_latest_opencode_assistant_text(data: Any) -> str:
+def extract_latest_opencode_assistant_text(data: Any, existing_message_ids: set[str] | None = None) -> str:
     messages = data.get("data") if isinstance(data, dict) else data
     if not isinstance(messages, list):
+        if is_completed_opencode_assistant_message(data, existing_message_ids):
+            info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            error_text = opencode_message_error_text(info)
+            if error_text:
+                return error_text
+            return extract_opencode_text(data.get("parts", []))
         return extract_opencode_text(data)
 
     for message in reversed(messages):
@@ -575,38 +873,73 @@ def extract_latest_opencode_assistant_text(data: Any) -> str:
         info = message.get("info") if isinstance(message.get("info"), dict) else {}
         if info.get("role") != "assistant":
             continue
-        error = info.get("error")
-        if isinstance(error, dict):
-            detail = error.get("data")
-            if isinstance(detail, dict) and detail.get("message"):
-                return f"OpenCode 执行失败：{detail['message']}"
-            if error.get("name"):
-                return f"OpenCode 执行失败：{error['name']}"
+        if existing_message_ids is not None and str(info.get("id") or "") in existing_message_ids:
+            continue
+        error_text = opencode_message_error_text(info)
+        if error_text:
+            return error_text
         text = extract_opencode_text(message.get("parts", []))
         if text:
             return text
     return ""
 
 
-def has_completed_opencode_assistant_message(data: Any) -> bool:
+def opencode_message_error_text(info: dict[str, Any]) -> str:
+    error = info.get("error")
+    if not isinstance(error, dict):
+        return ""
+    detail = error.get("data")
+    if isinstance(detail, dict) and detail.get("message"):
+        return f"OpenCode 执行失败：{detail['message']}"
+    if error.get("message"):
+        return f"OpenCode 执行失败：{error['message']}"
+    if error.get("name"):
+        return f"OpenCode 执行失败：{error['name']}"
+    return "OpenCode 执行失败"
+
+
+def has_completed_opencode_assistant_message(data: Any, existing_message_ids: set[str] | None = None) -> bool:
     messages = data.get("data") if isinstance(data, dict) else data
     if not isinstance(messages, list):
-        return bool(extract_opencode_text(data))
+        return is_completed_opencode_assistant_message(data, existing_message_ids)
 
     for message in reversed(messages):
+        if is_completed_opencode_assistant_message(message, existing_message_ids):
+            return True
+    return False
+
+
+def is_completed_opencode_assistant_message(message: Any, existing_message_ids: set[str] | None = None) -> bool:
+    if not isinstance(message, dict):
+        return False
+    info = message.get("info") if isinstance(message.get("info"), dict) else {}
+    if info.get("role") != "assistant":
+        return False
+    message_id = str(info.get("id") or "")
+    if existing_message_ids is not None and message_id in existing_message_ids:
+        return False
+    if info.get("error"):
+        return True
+    finish = info.get("finish")
+    if finish == "tool-calls":
+        return False
+    time_info = info.get("time") if isinstance(info.get("time"), dict) else {}
+    return bool(time_info.get("completed"))
+
+
+def opencode_message_ids(data: Any) -> set[str]:
+    messages = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(messages, list):
+        messages = [data]
+    ids: set[str] = set()
+    for message in messages:
         if not isinstance(message, dict):
             continue
         info = message.get("info") if isinstance(message.get("info"), dict) else {}
-        if info.get("role") != "assistant":
-            continue
-        if info.get("error"):
-            return True
-        finish = info.get("finish")
-        if finish == "tool-calls":
-            continue
-        time_info = info.get("time") if isinstance(info.get("time"), dict) else {}
-        return bool(time_info.get("completed"))
-    return False
+        message_id = info.get("id")
+        if message_id:
+            ids.add(str(message_id))
+    return ids
 
 
 async def call_ai_model(messages: list[dict[str, str]], model_config: dict[str, str]) -> str:
@@ -825,6 +1158,125 @@ def trim_session_messages(session: AiSession) -> None:
         session.messages = session.messages[-40:]
 
 
+def new_turn_id() -> str:
+    return f"turn_{uuid.uuid4().hex}"
+
+
+def next_session_turn_index(session: AiSession) -> int:
+    indexes = [
+        safe_int(message.get("turn_index"), 0)
+        for message in session.messages
+        if safe_int(message.get("turn_index"), 0) > 0
+    ]
+    return (max(indexes) + 1) if indexes else (len(messages_to_turns(session.messages)) + 1)
+
+
+def messages_to_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    turn_slots: list[dict[str, Any]] = []
+    explicit_slots: dict[str, dict[str, Any]] = {}
+    pending_slot: dict[str, Any] | None = None
+    fallback_index = 1
+
+    def new_slot() -> dict[str, Any]:
+        return {"user_message": None, "assistant_message": None, "fallback_index": len(turn_slots) + 1}
+
+    def add_to_slot(slot: dict[str, Any], message: dict[str, Any]) -> None:
+        role = message.get("role")
+        if role == "user" and slot["user_message"] is None:
+            slot["user_message"] = message
+        elif role == "assistant":
+            slot["assistant_message"] = message
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        turn_id = clean_optional_text(message.get("turn_id"))
+        if turn_id:
+            if pending_slot is not None:
+                turn_slots.append(pending_slot)
+                pending_slot = None
+            slot = explicit_slots.get(turn_id)
+            if slot is None:
+                slot = new_slot()
+                explicit_slots[turn_id] = slot
+                turn_slots.append(slot)
+            add_to_slot(slot, message)
+            continue
+
+        role = message.get("role")
+        if role == "user":
+            if pending_slot is not None:
+                turn_slots.append(pending_slot)
+            pending_slot = new_slot()
+            add_to_slot(pending_slot, message)
+            continue
+        if role != "assistant":
+            continue
+        if pending_slot is None:
+            pending_slot = new_slot()
+        add_to_slot(pending_slot, message)
+
+    if pending_slot is not None:
+        turn_slots.append(pending_slot)
+
+    turns = []
+    for slot in turn_slots:
+        turn = build_turn_record(slot["user_message"], slot["assistant_message"], fallback_index)
+        turns.append(turn)
+        fallback_index = max(fallback_index + 1, safe_int(turn.get("turn_index"), fallback_index) + 1)
+    return turns
+
+
+def build_turn_record(
+    user_message: dict[str, Any] | None,
+    assistant_message: dict[str, Any] | None,
+    fallback_index: int,
+) -> dict[str, Any]:
+    turn_id = clean_optional_text((assistant_message or {}).get("turn_id")) or clean_optional_text((user_message or {}).get("turn_id")) or new_turn_id()
+    turn_index = safe_int((assistant_message or {}).get("turn_index") or (user_message or {}).get("turn_index"), fallback_index)
+    user_payload = copy_message_for_turn(user_message, turn_id, turn_index) if user_message else None
+    assistant_payload = copy_message_for_turn(assistant_message, turn_id, turn_index) if assistant_message else None
+    created_at = clean_optional_text((user_payload or assistant_payload or {}).get("created_at")) or utc_now()
+    updated_at = clean_optional_text((assistant_payload or user_payload or {}).get("created_at")) or created_at
+    return {
+        "turn_id": turn_id,
+        "turn_index": turn_index,
+        "user_message": user_payload,
+        "assistant_message": assistant_payload,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def copy_message_for_turn(message: dict[str, Any] | None, turn_id: str, turn_index: int) -> dict[str, Any] | None:
+    if not isinstance(message, dict):
+        return None
+    copied = dict(message)
+    copied["turn_id"] = turn_id
+    copied["turn_index"] = turn_index
+    return copied
+
+
+def turns_to_messages(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for turn in sorted(turns, key=lambda item: safe_int(item.get("turn_index"), 0)):
+        user_message = turn.get("user_message")
+        assistant_message = turn.get("assistant_message")
+        turn_index = safe_int(turn.get("turn_index"), 0)
+        if isinstance(user_message, dict):
+            messages.append(copy_message_for_turn(user_message, str(turn["turn_id"]), turn_index) or user_message)
+        if isinstance(assistant_message, dict):
+            messages.append(copy_message_for_turn(assistant_message, str(turn["turn_id"]), turn_index) or assistant_message)
+    return messages
+
+
+def safe_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def require_session(session_id: str) -> AiSession:
     session = AI_SESSIONS.get(session_id)
     if not session:
@@ -881,6 +1333,38 @@ def init_session_store() -> None:
                     """
                 )
             )
+            connection.execute(
+                text(
+                    f"""
+                    create table if not exists {AI_SESSION_TURN_TABLE} (
+                        turn_id text primary key,
+                        session_id text not null,
+                        turn_index integer not null,
+                        user_message json,
+                        assistant_message json,
+                        created_at text not null,
+                        updated_at text not null
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    f"""
+                    create unique index if not exists {AI_SESSION_TURN_TABLE}_session_turn_idx
+                    on {AI_SESSION_TURN_TABLE} (session_id, turn_index)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    f"""
+                    create index if not exists {AI_SESSION_TURN_TABLE}_session_updated_idx
+                    on {AI_SESSION_TURN_TABLE} (session_id, updated_at)
+                    """
+                )
+            )
+            migrate_legacy_session_turns(connection, engine.dialect.name)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to initialize AI session store: {exc}") from exc
 
@@ -898,7 +1382,7 @@ def save_session(session: AiSession) -> None:
         "connection": json.dumps(session.connection.model_dump(), ensure_ascii=False),
         "connection_name": session.connection_name,
         "opencode_session_id": session.opencode_session_id,
-        "messages": json.dumps(session.messages, ensure_ascii=False, default=str),
+        "messages": json.dumps([], ensure_ascii=False),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -942,8 +1426,102 @@ def save_session(session: AiSession) -> None:
                     ),
                     payload,
                 )
+            save_session_turns(connection, engine.dialect.name, session)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save AI session: {exc}") from exc
+
+
+def save_session_turns(connection: Any, dialect_name: str, session: AiSession) -> None:
+    save_turn_rows(connection, dialect_name, session.id, messages_to_turns(session.messages))
+
+
+def save_turn_rows(connection: Any, dialect_name: str, session_id: str, turns: list[dict[str, Any]]) -> None:
+    for turn in turns:
+        payload = {
+            "turn_id": turn["turn_id"],
+            "session_id": session_id,
+            "turn_index": turn["turn_index"],
+            "user_message": json.dumps(turn["user_message"], ensure_ascii=False, default=str) if turn["user_message"] else None,
+            "assistant_message": json.dumps(turn["assistant_message"], ensure_ascii=False, default=str) if turn["assistant_message"] else None,
+            "created_at": turn["created_at"],
+            "updated_at": turn["updated_at"],
+        }
+        if dialect_name == "postgresql":
+            connection.execute(
+                text(
+                    f"""
+                    insert into {AI_SESSION_TURN_TABLE}
+                        (turn_id, session_id, turn_index, user_message, assistant_message, created_at, updated_at)
+                    values
+                        (:turn_id, :session_id, :turn_index, cast(:user_message as json),
+                         cast(:assistant_message as json), :created_at, :updated_at)
+                    on conflict (turn_id) do update set
+                        session_id = excluded.session_id,
+                        turn_index = excluded.turn_index,
+                        user_message = excluded.user_message,
+                        assistant_message = excluded.assistant_message,
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                payload,
+            )
+        else:
+            connection.execute(
+                text(
+                    f"""
+                    insert into {AI_SESSION_TURN_TABLE}
+                        (turn_id, session_id, turn_index, user_message, assistant_message, created_at, updated_at)
+                    values
+                        (:turn_id, :session_id, :turn_index, :user_message,
+                         :assistant_message, :created_at, :updated_at)
+                    on conflict (turn_id) do update set
+                        session_id = excluded.session_id,
+                        turn_index = excluded.turn_index,
+                        user_message = excluded.user_message,
+                        assistant_message = excluded.assistant_message,
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                payload,
+            )
+
+
+def migrate_legacy_session_turns(connection: Any, dialect_name: str) -> None:
+    rows = (
+        connection.execute(
+            text(
+                f"""
+                select id, messages
+                from {AI_SESSION_TABLE}
+                where messages is not null
+                """
+            )
+        )
+        .mappings()
+        .all()
+    )
+    for row in rows:
+        session_id = str(row["id"])
+        existing_turn = (
+            connection.execute(
+                text(
+                    f"""
+                    select 1
+                    from {AI_SESSION_TURN_TABLE}
+                    where session_id = :session_id
+                    limit 1
+                    """
+                ),
+                {"session_id": session_id},
+            )
+            .first()
+        )
+        if existing_turn:
+            continue
+        messages = normalize_legacy_messages(json_value(row["messages"], []))
+        if not messages:
+            continue
+        save_turn_rows(connection, dialect_name, session_id, messages_to_turns(messages))
 
 
 def load_session(session_id: str) -> AiSession | None:
@@ -978,12 +1556,64 @@ def load_session(session_id: str) -> AiSession | None:
         connection=ConnectionInfo(**json_value(row["connection"], {})),
         connection_name=row["connection_name"],
         opencode_session_id=row["opencode_session_id"],
-        messages=json_value(row["messages"], []),
+        messages=[],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
+    turns = load_session_turns(session.id)
+    if turns:
+        session.messages = turns_to_messages(turns)
+    else:
+        session.messages = normalize_legacy_messages(json_value(row["messages"], []))
+        if session.messages:
+            save_session(session)
     AI_SESSIONS[session.id] = session
     return session
+
+
+def load_session_turns(session_id: str) -> list[dict[str, Any]]:
+    if not session_store_enabled():
+        return []
+    engine = get_session_store_engine()
+    try:
+        with engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    text(
+                        f"""
+                        select turn_id, session_id, turn_index, user_message, assistant_message,
+                               created_at, updated_at
+                        from {AI_SESSION_TURN_TABLE}
+                        where session_id = :session_id
+                        order by turn_index asc, created_at asc
+                        """
+                    ),
+                    {"session_id": session_id},
+                )
+                .mappings()
+                .all()
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load AI session turns: {exc}") from exc
+
+    return [
+        {
+            "turn_id": str(row["turn_id"]),
+            "session_id": str(row["session_id"]),
+            "turn_index": int(row["turn_index"]),
+            "user_message": json_value(row["user_message"], None),
+            "assistant_message": json_value(row["assistant_message"], None),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+        for row in rows
+    ]
+
+
+def normalize_legacy_messages(messages: Any) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    return turns_to_messages(messages_to_turns([message for message in messages if isinstance(message, dict)]))
 
 
 def json_value(value: Any, fallback: Any) -> Any:
