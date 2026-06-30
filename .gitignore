@@ -10,6 +10,8 @@ app.db
 .DS_Store
 .venv/
 docs/
+log/
+*.log
 
 # AI assistant local runtime and secrets
 .runtime/
