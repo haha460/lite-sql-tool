@@ -282,15 +282,25 @@ async def chat_with_opencode(
     )
     session.updated_at = utc_now()
     ai_session_service.save_session(session)
-    opencode_session_id = await opencode_client.ensure_opencode_session(session, get_model_config(None), save_session=ai_session_service.save_session)
-    prompt = opencode_client.build_opencode_prompt(session.id, user_message)
-    existing_message_ids = opencode_client.opencode_message_ids(await opencode_client.load_opencode_messages(opencode_session_id))
-    response_data = await opencode_client.wait_for_opencode_response_sse_first(
-        opencode_session_id,
-        lambda: opencode_client.send_opencode_message(opencode_session_id, prompt, model_config),
-        existing_message_ids,
-    )
-    answer = opencode_client.extract_latest_opencode_assistant_text(response_data, existing_message_ids)
+
+    try:
+        opencode_session_id = await reusable_opencode_session_id(session, model_config)
+        prompt = opencode_client.build_opencode_prompt(session.id, user_message)
+        existing_message_ids = opencode_client.opencode_message_ids(await opencode_client.load_opencode_messages(opencode_session_id))
+        response_data = await opencode_client.wait_for_opencode_response_sse_first(
+            opencode_session_id,
+            lambda: opencode_client.send_opencode_message(opencode_session_id, prompt, model_config),
+            existing_message_ids,
+        )
+        answer = opencode_client.extract_latest_opencode_assistant_text(response_data, existing_message_ids)
+    except HTTPException as exc:
+        assistant_message = build_opencode_error_message(exc.detail, model_config, turn_id, turn_index)
+        session.messages.append(assistant_message)
+        session.updated_at = utc_now()
+        ai_session_service.trim_session_messages(session)
+        ai_session_service.save_session(session)
+        raise exc
+
     assistant_message = {
         "role": "assistant",
         "content": answer or "OpenCode did not return a text response.",
@@ -308,3 +318,42 @@ async def chat_with_opencode(
     ai_session_service.trim_session_messages(session)
     ai_session_service.save_session(session)
     return assistant_message
+
+
+async def reusable_opencode_session_id(session: AiSession, model_config: dict[str, str]) -> str:
+    opencode_session_id = await opencode_client.ensure_opencode_session(
+        session,
+        model_config,
+        save_session=ai_session_service.save_session,
+    )
+    try:
+        messages = await opencode_client.load_opencode_messages(opencode_session_id)
+    except HTTPException:
+        return await opencode_client.replace_opencode_session(
+            session,
+            model_config,
+            save_session=ai_session_service.save_session,
+        )
+    if opencode_client.has_unfinished_opencode_assistant_message(messages):
+        return await opencode_client.replace_opencode_session(
+            session,
+            model_config,
+            save_session=ai_session_service.save_session,
+        )
+    return opencode_session_id
+
+
+def build_opencode_error_message(detail: Any, model_config: dict[str, str], turn_id: str, turn_index: int) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": f"OpenCode 暂时没有返回可用回复：{detail}",
+        "model_id": model_config["id"],
+        "model": model_config["model"],
+        "sql": None,
+        "result": None,
+        "agent_backend": "opencode",
+        "error": str(detail),
+        "turn_id": turn_id,
+        "turn_index": turn_index,
+        "created_at": utc_now(),
+    }

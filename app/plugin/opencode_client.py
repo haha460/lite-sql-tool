@@ -42,11 +42,26 @@ async def ensure_opencode_session(
     if session.opencode_session_id:
         return session.opencode_session_id
 
+    return await replace_opencode_session(session, model_config, save_session)
+
+
+async def replace_opencode_session(
+    session: AiSession,
+    model_config: dict[str, str],
+    save_session: Callable[[AiSession], None],
+) -> str:
+    session.opencode_session_id = await create_opencode_session(session.connection_name or "Database analysis", model_config)
+    session.updated_at = utc_now()
+    save_session(session)
+    return session.opencode_session_id
+
+
+async def create_opencode_session(title: str, model_config: dict[str, str]) -> str:
     data = await opencode_request(
         "POST",
         "/session",
         json_payload={
-            "title": session.connection_name or "Database analysis",
+            "title": title,
             "agent": os.getenv("OPENCODE_AGENT", "db-analyst"),
             "model": opencode_model_object(model_config),
         },
@@ -54,9 +69,6 @@ async def ensure_opencode_session(
     session_id = extract_opencode_session_id(data)
     if not session_id:
         raise HTTPException(status_code=502, detail="OpenCode did not return a session id")
-    session.opencode_session_id = session_id
-    session.updated_at = utc_now()
-    save_session(session)
     return session_id
 
 
@@ -513,6 +525,21 @@ def has_completed_opencode_assistant_message(data: Any, existing_message_ids: se
     for message in reversed(messages):
         if is_completed_opencode_assistant_message(message, existing_message_ids):
             return True
+    return False
+
+
+def has_unfinished_opencode_assistant_message(data: Any) -> bool:
+    messages = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(messages, list):
+        messages = [data]
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info") if isinstance(message.get("info"), dict) else {}
+        if info.get("role") != "assistant":
+            continue
+        return not is_completed_opencode_assistant_message(message)
     return False
 
 

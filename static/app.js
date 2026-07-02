@@ -888,7 +888,7 @@ async function submitAiMessage(event) {
   } catch (error) {
     state.aiMessages.pop();
     state.aiMessages.push({ role: "assistant", content: error.message });
-    if (/session/i.test(error.message) || /会话/.test(error.message)) {
+    if (/AI session not found/i.test(error.message) || /会话不存在/.test(error.message)) {
       await resetAiSession({ keepMessages: true });
     }
   } finally {
@@ -901,6 +901,7 @@ async function submitAiMessage(event) {
 function useAiSqlInEditor() {
   if (!state.aiLastSql) return;
   els.sqlEditor.value = state.aiLastSql;
+  rememberActiveTabSql();
   els.sqlEditor.focus();
   hideSqlAutocomplete();
   setMessage("AI 生成的 SQL 已放入编辑器");
@@ -908,6 +909,7 @@ function useAiSqlInEditor() {
 
 function setupSqlAutocomplete() {
   els.sqlEditor.addEventListener("input", () => {
+    rememberActiveTabSql();
     window.requestAnimationFrame(() => updateSqlAutocomplete());
   });
   els.sqlEditor.addEventListener("keydown", handleSqlAutocompleteKeyDown);
@@ -1851,6 +1853,31 @@ function tableTabId(tableName) {
   return `${state.activeConnectionId || "connection"}::${tableName}`;
 }
 
+function defaultSqlForTable(table) {
+  return `select * from ${table.name}`;
+}
+
+function activeTableTab() {
+  return state.tabs.find((tab) => tab.id === state.activeTabId) || null;
+}
+
+function rememberActiveTabSql() {
+  const tab = activeTableTab();
+  if (!tab) return;
+  const sql = els.sqlEditor.value;
+  tab.sql = sql;
+  if (state.activeQuery && state.activeQuery.sql !== sql) {
+    state.activeQuery = null;
+    tab.activeQuery = null;
+  }
+}
+
+function rememberActiveTabQuery(activeQuery = state.activeQuery) {
+  const tab = activeTableTab();
+  if (!tab) return;
+  tab.activeQuery = activeQuery ? { ...activeQuery } : null;
+}
+
 function renderTabs() {
   els.tabBar.innerHTML = "";
   state.tabs.forEach((tab) => {
@@ -1892,6 +1919,8 @@ function openTableTab(table) {
       connection: { ...connection },
       connectionId: connection.id,
       hostLabel: connectionHostLabel(),
+      sql: defaultSqlForTable(table),
+      activeQuery: null,
     };
     state.tabs.push(tab);
   }
@@ -1903,18 +1932,24 @@ async function switchTab(id) {
   if (!tab) return;
 
   hideSqlAutocomplete();
+  rememberActiveTabSql();
+  rememberActiveTabQuery();
   state.activeTabId = id;
   state.activeConnectionId = tab.connectionId;
   state.activeTable = tab.table;
   state.queryMode = false;
-  state.activeQuery = null;
+  state.activeQuery = tab.activeQuery ? { ...tab.activeQuery } : null;
   clearPendingChanges();
   renderTabs();
   renderConnections();
-  els.viewTitle.textContent = `浏览数据 ${tab.table.name}`;
-  els.viewMeta.textContent = `${tab.hostLabel}，每次加载 ${TABLE_ROW_LIMIT} 行${tab.connection.readonly ? "，只读连接" : ""}`;
-  els.sqlEditor.value = `select * from ${tab.table.name}`;
-  await loadRows({ append: false });
+  els.sqlEditor.value = tab.sql || defaultSqlForTable(tab.table);
+  if (state.activeQuery) {
+    await loadQueryRows({ append: false, sql: state.activeQuery.sql, limit: state.activeQuery.limit, restoreTabQuery: true });
+  } else {
+    els.viewTitle.textContent = `浏览数据 ${tab.table.name}`;
+    els.viewMeta.textContent = `${tab.hostLabel}，每次加载 ${TABLE_ROW_LIMIT} 行${tab.connection.readonly ? "，只读连接" : ""}`;
+    await loadRows({ append: false });
+  }
 }
 
 function closeTab(id) {
@@ -2354,6 +2389,7 @@ async function loadRows({ append = false } = {}) {
   state.isLoadingRows = true;
   if (!append) {
     state.activeQuery = null;
+    rememberActiveTabQuery(null);
   }
   const offset = append ? state.activeRealRowsLoaded : 0;
   if (!append) {
@@ -2446,7 +2482,7 @@ function finishRowsLoading() {
   }
 }
 
-async function loadQueryRows({ append = false } = {}) {
+async function loadQueryRows({ append = false, sql: explicitSql = null, limit: explicitLimit = null, restoreTabQuery = false } = {}) {
   if (isRedisOnly()) {
     setMessage("Redis 连接不能执行 SQL 查询", true);
     return;
@@ -2454,11 +2490,15 @@ async function loadQueryRows({ append = false } = {}) {
   if (state.isLoadingRows) return;
   if (append && (!state.activeQuery || !state.activeRowsHasMore)) return;
 
-  const sql = append ? state.activeQuery?.sql : els.sqlEditor.value;
-  const queryLimit = append ? state.activeQuery?.limit || QUERY_ROW_LIMIT : Number(els.limitInput.value || QUERY_ROW_LIMIT);
+  const sql = append ? state.activeQuery?.sql : explicitSql || els.sqlEditor.value;
+  const queryLimit = append ? state.activeQuery?.limit || QUERY_ROW_LIMIT : Number(explicitLimit || els.limitInput.value || QUERY_ROW_LIMIT);
   const offset = append ? state.activeRealRowsLoaded : 0;
   if (!sql) return;
 
+  if (!append) {
+    els.sqlEditor.value = sql;
+    rememberActiveTabSql();
+  }
   state.isLoadingRows = true;
   setMessage(append ? `正在继续加载 ${queryLimit} 行查询结果...` : `正在执行查询，默认限制 ${queryLimit} 行...`);
   try {
@@ -2477,6 +2517,9 @@ async function loadQueryRows({ append = false } = {}) {
     state.activeRowsHasMore = hasMoreRows(data);
     state.activeRealRowsLoaded = Number.isFinite(data.loaded) ? data.loaded : offset + data.rows.length;
     state.activeQuery = { sql, limit: queryLimit, tableName: tableForQuery?.name || null };
+    if (!append && restoreTabQuery) {
+      rememberActiveTabQuery(state.activeQuery);
+    }
     if (!append) {
       clearPendingChanges();
     }
@@ -2496,7 +2539,18 @@ async function loadQueryRows({ append = false } = {}) {
       els.viewTitle.textContent = `浏览数据 ${tableForQuery.name}`;
       els.viewMeta.textContent = isReadOnlyActive() ? "当前为 SQL 筛选结果，只读连接" : "当前为 SQL 筛选结果，可选择和编辑";
       syncTableLoadedCount(tableForQuery, state.activeRealRowsLoaded);
+      if (!append) {
+        const matchingTab = state.tabs.find((tab) => tab.connectionId === state.activeConnectionId && tab.table.name === tableForQuery.name);
+        if (matchingTab) {
+          state.activeTabId = matchingTab.id;
+          matchingTab.sql = sql;
+          matchingTab.activeQuery = { ...state.activeQuery };
+          renderTabs();
+          renderConnections();
+        }
+      }
     } else {
+      rememberActiveTabQuery(null);
       state.queryMode = true;
       state.activeTabId = null;
       state.activeTable = null;
@@ -3082,6 +3136,8 @@ els.refreshButton.addEventListener("click", async () => {
     renderGrid([], [], false);
     els.viewMeta.textContent = `${connectionHostLabel()}，Redis 连接已激活`;
     setMessage("Redis 连接成功");
+  } else if (state.activeQuery) {
+    await loadQueryRows({ append: false, sql: state.activeQuery.sql, limit: state.activeQuery.limit, restoreTabQuery: true });
   } else if (state.queryMode) {
     await runQuery();
   } else if (state.activeTable) {
