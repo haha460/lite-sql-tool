@@ -3,6 +3,7 @@ const state = {
   activeConnectionId: null,
   editingConnectionId: null,
   deletingConnectionId: null,
+  expandedConnectionIds: new Set(),
   tabs: [],
   activeTabId: null,
   activeTable: null,
@@ -1660,7 +1661,7 @@ function renderConnections() {
   state.connections.forEach((connection) => {
     const item = document.createElement("details");
     item.className = "connection-item";
-    item.open = connection.id === state.activeConnectionId;
+    item.open = connection.id === state.activeConnectionId || state.expandedConnectionIds.has(connection.id);
     item.classList.toggle("active", connection.id === state.activeConnectionId);
     item.title = isRedisOnly(connection)
       ? `Redis: ${connection.redisUrl || DEFAULT_REDIS_URL}`
@@ -1701,7 +1702,7 @@ function renderConnections() {
 
     main.append(badges, name, activeDot);
     main.addEventListener("click", () => {
-      useConnection(connection.id);
+      handleConnectionClick(connection.id);
     });
 
     const edit = document.createElement("button");
@@ -2006,7 +2007,10 @@ async function addConnection(event) {
     existing.redisEnabled = redisEnabled;
     existing.sqlConnected = false;
     existing.redisConnected = false;
+    existing.tables = [];
+    existing.loadingTables = false;
     existing.readonly = readonly;
+    state.expandedConnectionIds.delete(existing.id);
     state.tabs.forEach((tab) => {
       if (tab.connectionId === oldActiveId) {
         tab.connection = { ...existing };
@@ -2066,6 +2070,41 @@ async function confirmDeleteConnection() {
   await deleteConnection(id);
 }
 
+async function handleConnectionClick(id) {
+  const connection = connectionById(id);
+  if (!connection) return;
+
+  const hasLoadedTables = !isRedisOnly(connection) && Array.isArray(connection.tables) && connection.tables.length > 0;
+  const alreadyConnected = isRedisOnly(connection)
+    ? Boolean(connection.redisConnected)
+    : Boolean(connection.sqlConnected && hasLoadedTables);
+
+  if (!alreadyConnected) {
+    await useConnection(id);
+    return;
+  }
+
+  state.expandedConnectionIds.add(id);
+  if (!state.activeTable && !state.queryMode) {
+    state.activeConnectionId = id;
+  }
+  renderConnections();
+  if (isRedisOnly(connection)) {
+    if (!state.activeTable && !state.queryMode) {
+      renderGrid([], [], false);
+      els.viewTitle.textContent = connection.name;
+      els.viewMeta.textContent = `${connectionHostLabel()}，Redis 连接已激活`;
+    }
+    setMessage("Redis 连接已展开");
+  } else if (!state.activeTable && !state.queryMode) {
+    els.viewTitle.textContent = connection.name;
+    els.viewMeta.textContent = "已连接，点击左侧数据表打开或切换 tab";
+    setMessage(`已显示 ${connection.tables.length} 个数据表`);
+  } else {
+    setMessage(`已显示 ${connection.tables.length} 个数据表`);
+  }
+}
+
 async function deleteConnection(id) {
   if (state.aiConnectionId === id) {
     setCurrentAiSession(null);
@@ -2075,6 +2114,7 @@ async function deleteConnection(id) {
     renderAiMessages();
   }
   await forgetAiSessionForConnection(id);
+  state.expandedConnectionIds.delete(id);
   state.connections = state.connections.filter((connection) => connection.id !== id);
   state.tabs = state.tabs.filter((tab) => tab.connectionId !== id);
   if (state.activeConnectionId === id) {
@@ -2126,6 +2166,7 @@ async function useConnection(id) {
   setMessage("正在连接数据库...");
   try {
     await loadHealth();
+    state.expandedConnectionIds.add(id);
     if (isRedisOnly(connection)) {
       renderGrid([], [], false);
       els.viewTitle.textContent = connection.name;
