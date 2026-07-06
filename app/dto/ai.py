@@ -40,3 +40,10 @@ class AiToolSelectRequest(BaseModel):
     session_id: str
     sql: str = Field(min_length=1)
     limit: int = Field(default=DEFAULT_AI_LIMIT, ge=1, le=MAX_AI_LIMIT)
+
+
+class AiSkillUploadRequest(BaseModel):
+    session_id: str
+    filename: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    model_id: str | None = None

@@ -33,6 +33,8 @@ const state = {
   aiConnectionId: null,
   aiMessages: [],
   aiBusy: false,
+  aiSkillBusy: false,
+  aiSkill: null,
   aiLastSql: "",
   aiModelId: sessionStorage.getItem("sqlRedisVisualAiModelId") || null,
   aiPanelCollapsed: localStorage.getItem("sqlRedisVisualAiPanelCollapsed") === "1",
@@ -189,6 +191,9 @@ const els = {
   aiBackendBadge: document.querySelector("#aiBackendBadge"),
   aiModelSelect: document.querySelector("#aiModelSelect"),
   aiConnectionSelect: document.querySelector("#aiConnectionSelect"),
+  aiSkillFile: document.querySelector("#aiSkillFile"),
+  aiSkillUploadButton: document.querySelector("#aiSkillUploadButton"),
+  aiSkillStatus: document.querySelector("#aiSkillStatus"),
   aiMessageList: document.querySelector("#aiMessageList"),
   aiSqlCard: document.querySelector("#aiSqlCard"),
   aiSqlText: document.querySelector("#aiSqlText"),
@@ -205,11 +210,43 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-  const data = await response.json().catch(() => ({}));
+  const rawText = await response.text();
+  const data = rawText ? parseApiJson(rawText) : {};
   if (!response.ok) {
-    throw new Error(data.detail || `Request failed: ${response.status}`);
+    throw new Error(apiErrorMessage(response, data, rawText));
   }
   return data;
+}
+
+function parseApiJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+function apiErrorMessage(response, data, rawText) {
+  const detail = data?.detail ?? data?.message ?? data?.error;
+  const message = normalizeApiErrorDetail(detail) || rawText?.trim();
+  return message || `Request failed: ${response.status}`;
+}
+
+function normalizeApiErrorDetail(detail) {
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => normalizeApiErrorDetail(item))
+      .filter(Boolean)
+      .join("；");
+  }
+  if (typeof detail === "object") {
+    const location = Array.isArray(detail.loc) ? detail.loc.join(".") : "";
+    const message = detail.msg || detail.message || detail.error || JSON.stringify(detail);
+    return location ? `${location}: ${message}` : String(message);
+  }
+  return String(detail);
 }
 
 function activeConnection() {
@@ -399,6 +436,7 @@ function updateAiControls() {
   const backendLabel = aiBackendLabel();
   els.aiSendButton.disabled = state.aiBusy || !configured || !hasModel || !hasConnection;
   els.aiPrompt.disabled = state.aiBusy || !configured || !hasModel || !hasConnection;
+  els.aiSkillUploadButton.disabled = state.aiBusy || state.aiSkillBusy || !configured || !hasModel || !hasConnection;
   els.aiModelSelect.disabled = state.aiBusy || !configured || (state.aiConfig?.models || []).length === 0;
   els.aiConnectionSelect.disabled = state.aiBusy || aiEligibleConnections().length === 0;
   els.aiResetButton.disabled = state.aiBusy;
@@ -417,6 +455,19 @@ function updateAiControls() {
     ? `${backendLabel}，已配置 ${(state.aiConfig.models || []).length} 个模型`
     : "未配置 AI_MODELS 或 AI_API_BASE / AI_API_KEY / AI_MODEL";
   els.aiConfigStatus.classList.toggle("error", state.aiConfig && !configured);
+  renderAiSkillStatus();
+}
+
+function renderAiSkillStatus() {
+  const skill = state.aiSkill;
+  const text = state.aiSkillBusy
+    ? "正在生成 Skill..."
+    : skill?.path
+      ? `已绑定：${skill.name || skill.path}`
+      : "未绑定 Skill";
+  els.aiSkillStatus.textContent = text;
+  els.aiSkillStatus.title = skill?.path ? `${skill.path}${skill.source_filename ? `（来源：${skill.source_filename}）` : ""}` : text;
+  els.aiSkillStatus.classList.toggle("bound", Boolean(skill?.path));
 }
 
 function renderMarkdown(text) {
@@ -768,6 +819,7 @@ async function restoreAiSessionMessages() {
       return;
     }
     state.aiMessages = Array.isArray(data.messages) ? data.messages : [];
+    await loadAiSkillStatus();
     renderAiMessages();
   } catch (error) {
     if (requestId !== state.aiRestoreRequestId || connectionId !== state.aiConnectionId) return;
@@ -805,6 +857,7 @@ async function lookupAiSessionForCurrentConnection(requestId = ++state.aiRestore
     state.aiSessionByConnection[connectionId] = state.aiSessionId;
     await saveAiSessionMap();
     state.aiMessages = Array.isArray(session.messages) ? session.messages : [];
+    await loadAiSkillStatus();
     renderAiMessages();
   } catch (error) {
     if (requestId !== state.aiRestoreRequestId || connectionId !== state.aiConnectionId) return;
@@ -816,10 +869,20 @@ async function lookupAiSessionForCurrentConnection(requestId = ++state.aiRestore
 async function switchAiConnection(connectionId) {
   await rememberCurrentAiSession();
   state.aiConnectionId = connectionId || null;
+  state.aiSkill = null;
   const sessionId = state.aiConnectionId ? state.aiSessionByConnection[state.aiConnectionId] : null;
   setCurrentAiSession(sessionId || null);
   showAiSql("");
-  await restoreAiSessionMessages();
+  try {
+    await restoreAiSessionMessages();
+    await loadAiSkillStatus();
+  } catch (error) {
+    state.aiMessages = [];
+    state.aiSkill = null;
+    renderAiMessages();
+    renderAiSkillStatus();
+    setMessage(`恢复 AI 会话失败：${error.message}`, true);
+  }
   updateAiControls();
 }
 
@@ -843,12 +906,58 @@ async function ensureAiSession() {
     state.aiSessionByConnection[state.aiConnectionId] = state.aiSessionId;
     await saveAiSessionMap();
   }
+  await loadAiSkillStatus();
   return state.aiSessionId;
+}
+
+async function loadAiSkillStatus() {
+  if (!state.aiSessionId) {
+    state.aiSkill = null;
+    renderAiSkillStatus();
+    return;
+  }
+  try {
+    const data = await api(`/api/ai/sessions/${encodeURIComponent(state.aiSessionId)}/skill`);
+    state.aiSkill = data.skill || null;
+  } catch {
+    state.aiSkill = null;
+  }
+  renderAiSkillStatus();
+}
+
+async function uploadAiSkillFromFile(file) {
+  if (!file || state.aiSkillBusy) return;
+  state.aiSkillBusy = true;
+  updateAiControls();
+  try {
+    const sessionId = await ensureAiSession();
+    const content = await file.text();
+    const data = await api("/api/ai/skills/upload", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId,
+        filename: file.name,
+        content,
+        model_id: state.aiModelId,
+      }),
+    });
+    state.aiSkill = data.skill || null;
+    const fallbackNote = state.aiSkill?.generated_by === "local_fallback" ? "（AI 转换失败，已本地兜底导入）" : "";
+    setMessage(`Skill 已生成并导入：${state.aiSkill?.path || file.name}${fallbackNote}`);
+  } catch (error) {
+    setMessage(`Skill 上传失败：${error.message}`, true);
+  } finally {
+    state.aiSkillBusy = false;
+    els.aiSkillFile.value = "";
+    updateAiControls();
+  }
 }
 
 async function resetAiSession({ keepMessages = false } = {}) {
   await forgetAiSessionForConnection(state.aiConnectionId);
   setCurrentAiSession(null);
+  state.aiSkill = null;
+  renderAiSkillStatus();
   showAiSql("");
   if (!keepMessages) {
     state.aiMessages = [];
@@ -1661,7 +1770,14 @@ function renderConnections() {
   state.connections.forEach((connection) => {
     const item = document.createElement("details");
     item.className = "connection-item";
-    item.open = connection.id === state.activeConnectionId || state.expandedConnectionIds.has(connection.id);
+    item.open = state.expandedConnectionIds.has(connection.id);
+    item.addEventListener("toggle", () => {
+      if (item.open) {
+        state.expandedConnectionIds.add(connection.id);
+      } else {
+        state.expandedConnectionIds.delete(connection.id);
+      }
+    });
     item.classList.toggle("active", connection.id === state.activeConnectionId);
     item.title = isRedisOnly(connection)
       ? `Redis: ${connection.redisUrl || DEFAULT_REDIS_URL}`
@@ -1701,7 +1817,8 @@ function renderConnections() {
     activeDot.hidden = !connection.sqlConnected && !connection.redisConnected;
 
     main.append(badges, name, activeDot);
-    main.addEventListener("click", () => {
+    main.addEventListener("click", (event) => {
+      event.preventDefault();
       handleConnectionClick(connection.id);
     });
 
@@ -1879,6 +1996,44 @@ function rememberActiveTabQuery(activeQuery = state.activeQuery) {
   tab.activeQuery = activeQuery ? { ...activeQuery } : null;
 }
 
+function activeTableSort() {
+  const tab = activeTableTab();
+  const sort = state.activeQuery?.sort || tab?.sort || null;
+  if (!sort?.column || !["asc", "desc"].includes(sort.dir)) return null;
+  const hasColumn = state.gridColumns.includes(sort.column) || state.activeTable?.columns?.some((column) => column.name === sort.column);
+  return hasColumn ? sort : null;
+}
+
+function canSortGridColumns() {
+  return Boolean(state.gridColumns.length > 0 && (state.activeQuery || (state.activeTable && activeTableTab() && !state.queryMode)));
+}
+
+async function sortTableByColumn(column) {
+  if (!canSortGridColumns()) return;
+  const current = activeTableSort();
+  const nextSort = {
+    column,
+    dir: current?.column === column && current.dir === "asc" ? "desc" : "asc",
+  };
+  if (state.activeQuery) {
+    state.activeQuery.sort = nextSort;
+    rememberActiveTabQuery(state.activeQuery);
+    await loadQueryRows({
+      append: false,
+      sql: state.activeQuery.sql,
+      limit: state.activeQuery.limit,
+      sort: nextSort,
+      restoreTabQuery: true,
+    });
+    return;
+  }
+
+  const tab = activeTableTab();
+  if (!tab) return;
+  tab.sort = nextSort;
+  await loadRows({ append: false });
+}
+
 function renderTabs() {
   els.tabBar.innerHTML = "";
   state.tabs.forEach((tab) => {
@@ -1922,6 +2077,7 @@ function openTableTab(table) {
       hostLabel: connectionHostLabel(),
       sql: defaultSqlForTable(table),
       activeQuery: null,
+      sort: null,
     };
     state.tabs.push(tab);
   }
@@ -1945,7 +2101,13 @@ async function switchTab(id) {
   renderConnections();
   els.sqlEditor.value = tab.sql || defaultSqlForTable(tab.table);
   if (state.activeQuery) {
-    await loadQueryRows({ append: false, sql: state.activeQuery.sql, limit: state.activeQuery.limit, restoreTabQuery: true });
+    await loadQueryRows({
+      append: false,
+      sql: state.activeQuery.sql,
+      limit: state.activeQuery.limit,
+      sort: state.activeQuery.sort || null,
+      restoreTabQuery: true,
+    });
   } else {
     els.viewTitle.textContent = `浏览数据 ${tab.table.name}`;
     els.viewMeta.textContent = `${tab.hostLabel}，每次加载 ${TABLE_ROW_LIMIT} 行${tab.connection.readonly ? "，只读连接" : ""}`;
@@ -2438,7 +2600,16 @@ async function loadRows({ append = false } = {}) {
   }
   setMessage(append ? `正在继续加载 ${TABLE_ROW_LIMIT} 行数据...` : `正在加载前 ${TABLE_ROW_LIMIT} 行数据...`);
   try {
-    const data = await api(`/api/tables/${encodeURIComponent(state.activeTable.name)}/rows?limit=${TABLE_ROW_LIMIT}&offset=${offset}`, {
+    const params = new URLSearchParams({
+      limit: String(TABLE_ROW_LIMIT),
+      offset: String(offset),
+    });
+    const sort = activeTableSort();
+    if (sort) {
+      params.set("sort_by", sort.column);
+      params.set("sort_dir", sort.dir);
+    }
+    const data = await api(`/api/tables/${encodeURIComponent(state.activeTable.name)}/rows?${params.toString()}`, {
       method: "POST",
       body: JSON.stringify(connectionPayload()),
     });
@@ -2523,7 +2694,13 @@ function finishRowsLoading() {
   }
 }
 
-async function loadQueryRows({ append = false, sql: explicitSql = null, limit: explicitLimit = null, restoreTabQuery = false } = {}) {
+async function loadQueryRows({
+  append = false,
+  sql: explicitSql = null,
+  limit: explicitLimit = null,
+  sort: explicitSort = undefined,
+  restoreTabQuery = false,
+} = {}) {
   if (isRedisOnly()) {
     setMessage("Redis 连接不能执行 SQL 查询", true);
     return;
@@ -2534,6 +2711,11 @@ async function loadQueryRows({ append = false, sql: explicitSql = null, limit: e
   const sql = append ? state.activeQuery?.sql : explicitSql || els.sqlEditor.value;
   const queryLimit = append ? state.activeQuery?.limit || QUERY_ROW_LIMIT : Number(explicitLimit || els.limitInput.value || QUERY_ROW_LIMIT);
   const offset = append ? state.activeRealRowsLoaded : 0;
+  const querySort = append
+    ? state.activeQuery?.sort || null
+    : explicitSort === undefined
+      ? state.activeQuery?.sort || null
+      : explicitSort;
   if (!sql) return;
 
   if (!append) {
@@ -2551,6 +2733,8 @@ async function loadQueryRows({ append = false, sql: explicitSql = null, limit: e
         connection: connectionPayload(),
         limit: queryLimit,
         offset,
+        sort_by: querySort?.column || null,
+        sort_dir: querySort?.dir || "asc",
       }),
     });
     const parsedTotal = parseOptionalNumber(data.total);
@@ -2558,6 +2742,9 @@ async function loadQueryRows({ append = false, sql: explicitSql = null, limit: e
     state.activeRowsHasMore = hasMoreRows(data);
     state.activeRealRowsLoaded = Number.isFinite(data.loaded) ? data.loaded : offset + data.rows.length;
     state.activeQuery = { sql, limit: queryLimit, tableName: tableForQuery?.name || null };
+    if (querySort) {
+      state.activeQuery.sort = { ...querySort };
+    }
     if (!append && restoreTabQuery) {
       rememberActiveTabQuery(state.activeQuery);
     }
@@ -2617,7 +2804,7 @@ async function loadQueryRows({ append = false, sql: explicitSql = null, limit: e
 }
 
 async function runQuery() {
-  await loadQueryRows({ append: false });
+  await loadQueryRows({ append: false, sort: null });
 }
 
 function tableFromQuery(sql) {
@@ -2672,13 +2859,35 @@ function renderGrid(columns, rows, editable, options = {}) {
     selectHeader.dataset.colIndex = "1";
     headerRow.appendChild(selectHeader);
   }
+  const sortable = canSortGridColumns();
+  const sort = sortable ? activeTableSort() : null;
   columns.forEach((column, columnIndex) => {
     const displayIndex = editable && state.activeTable?.primary_key ? columnIndex + 2 : columnIndex + 1;
     const th = document.createElement("th");
     th.dataset.colIndex = String(displayIndex);
-    const label = document.createElement("span");
-    label.className = "th-label";
-    label.textContent = column;
+    const isSorted = sort?.column === column;
+    const label = sortable ? document.createElement("button") : document.createElement("span");
+    label.className = sortable ? "th-label th-sort-button" : "th-label";
+    if (sortable) {
+      label.type = "button";
+      label.classList.toggle("active", isSorted);
+      label.title = isSorted
+        ? `按 ${column} ${sort.dir === "asc" ? "降序" : "升序"}排序`
+        : `按 ${column} 升序排序`;
+      th.setAttribute("aria-sort", isSorted ? (sort.dir === "asc" ? "ascending" : "descending") : "none");
+      label.addEventListener("click", () => {
+        sortTableByColumn(column).catch((error) => setMessage(error.message, true));
+      });
+      const labelText = document.createElement("span");
+      labelText.className = "th-label-text";
+      labelText.textContent = column;
+      const indicator = document.createElement("span");
+      indicator.className = "th-sort-indicator";
+      indicator.textContent = isSorted ? (sort.dir === "asc" ? "↑" : "↓") : "";
+      label.append(labelText, indicator);
+    } else {
+      label.textContent = column;
+    }
     const handle = document.createElement("span");
     handle.className = "column-resize-handle";
     handle.title = "拖动调整列宽";
@@ -3178,7 +3387,13 @@ els.refreshButton.addEventListener("click", async () => {
     els.viewMeta.textContent = `${connectionHostLabel()}，Redis 连接已激活`;
     setMessage("Redis 连接成功");
   } else if (state.activeQuery) {
-    await loadQueryRows({ append: false, sql: state.activeQuery.sql, limit: state.activeQuery.limit, restoreTabQuery: true });
+    await loadQueryRows({
+      append: false,
+      sql: state.activeQuery.sql,
+      limit: state.activeQuery.limit,
+      sort: state.activeQuery.sort || null,
+      restoreTabQuery: true,
+    });
   } else if (state.queryMode) {
     await runQuery();
   } else if (state.activeTable) {
@@ -3212,6 +3427,12 @@ els.aiUseSqlButton.addEventListener("click", useAiSqlInEditor);
 els.aiResetButton.addEventListener("click", () => {
   resetAiSession().catch((error) => setMessage(`重置 AI 会话失败：${error.message}`, true));
 });
+els.aiSkillUploadButton.addEventListener("click", () => {
+  els.aiSkillFile.click();
+});
+els.aiSkillFile.addEventListener("change", () => {
+  uploadAiSkillFromFile(els.aiSkillFile.files?.[0]).catch((error) => setMessage(`Skill 上传失败：${error.message}`, true));
+});
 els.aiCloseButton.addEventListener("click", () => setAiPanelCollapsed(true));
 els.aiOpenButton.addEventListener("click", () => setAiPanelCollapsed(false));
 els.aiModelSelect.addEventListener("change", () => {
@@ -3241,24 +3462,31 @@ document.querySelectorAll('input[name="connectionMode"]').forEach((input) => {
 });
 
 async function start() {
-  sessionStorage.removeItem("sqlRedisVisualAiSessionId");
-  setupSidebarResize();
-  setupAiPanelResize();
-  setupSqlAutocomplete();
-  state.connections = await loadStoredConnections();
-  await loadAiSessionLinks();
-  els.redisUrl.value = DEFAULT_REDIS_URL;
-  setRedisEnabled(false);
-  els.limitInput.value = QUERY_ROW_LIMIT;
-  renderConnections();
-  setPendingStatus();
-  updateCommitButton();
-  els.viewTitle.textContent = state.connections.length > 0 ? "选择连接" : "添加连接";
-  els.viewMeta.textContent = "连接信息保存在后端本地配置，不会自动连接数据库";
-  setMessage("添加或点击左侧连接后开始浏览数据");
-  renderAiMessages();
-  await loadAiConfig();
-  await restoreAiSessionMessages();
+  try {
+    sessionStorage.removeItem("sqlRedisVisualAiSessionId");
+    setupSidebarResize();
+    setupAiPanelResize();
+    setupSqlAutocomplete();
+    state.connections = await loadStoredConnections();
+    await loadAiSessionLinks();
+    els.redisUrl.value = DEFAULT_REDIS_URL;
+    setRedisEnabled(false);
+    els.limitInput.value = QUERY_ROW_LIMIT;
+    renderConnections();
+    setPendingStatus();
+    updateCommitButton();
+    els.viewTitle.textContent = state.connections.length > 0 ? "选择连接" : "添加连接";
+    els.viewMeta.textContent = "连接信息保存在后端本地配置，不会自动连接数据库";
+    setMessage("添加或点击左侧连接后开始浏览数据");
+    renderAiMessages();
+    await loadAiConfig();
+    await restoreAiSessionMessages();
+  } catch (error) {
+    setMessage(`页面初始化失败：${error.message}`, true);
+    console.error(error);
+  } finally {
+    updateAiControls();
+  }
 }
 
 [

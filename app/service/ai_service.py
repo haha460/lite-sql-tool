@@ -10,7 +10,7 @@ from app.dto.database import ConnectionInfo
 from app.model.settings import AI_SESSION_LINKS_FILE, RUNTIME_DIR
 from app.model.ai_session import AiSession
 from app.plugin import ai_model_client, opencode_client
-from app.service import ai_database_service, ai_session_service
+from app.service import ai_database_service, ai_session_service, ai_skill_service
 from app.service.common import clean_optional_text
 from app.service.time_service import utc_now
 
@@ -189,7 +189,7 @@ async def chat_with_direct_model(
     limit: int,
     model_config: dict[str, str],
 ) -> dict[str, Any]:
-    schema = ai_database_service.load_schema(session.connection)
+    schema = ai_database_service.load_schema(session.connection, ai_skill_service.current_skill_for_session(session))
     turn_id = ai_session_service.new_turn_id()
     turn_index = ai_session_service.next_session_turn_index(session)
     session.messages.append(

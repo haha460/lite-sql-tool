@@ -14,6 +14,17 @@ from app.plugin.database_client import create_sql_engine, get_engine, get_redis_
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SELECT_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+SQL_IDENTIFIER_PART = r'(?:[A-Za-z_][A-Za-z0-9_]*|`[^`]+`|"[^"]+"|\[[^\]]+\])'
+SQL_IDENTIFIER_PATH = rf"{SQL_IDENTIFIER_PART}(?:\s*\.\s*{SQL_IDENTIFIER_PART})*"
+INCOMPLETE_SQL_TAIL_RE = re.compile(
+    r"(\bwhere\b|\band\b|\bor\b|\bnot\b|=|<>|!=|<=|>=|<|>|\blike\b|\bin\b|\bis\b|\bbetween\b)\s*$",
+    re.IGNORECASE,
+)
+BARE_WHERE_IDENTIFIER_RE = re.compile(
+    rf"\bwhere\s+(?P<column>{SQL_IDENTIFIER_PATH})\s*(?=$|\border\s+by\b|\bgroup\s+by\b|\blimit\b|\boffset\b|\bfetch\b)",
+    re.IGNORECASE,
+)
+SQL_BOOLEAN_LITERALS = {"true", "false", "null"}
 
 
 def health() -> dict[str, Any]:
@@ -98,13 +109,16 @@ def get_table_rows(
     limit: int,
     offset: int,
     include_total: bool,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
 ) -> dict[str, Any]:
     ensure_sql_enabled(connection)
     engine = create_sql_engine(connection.sql_url)
     try:
-        ensure_table_exists(engine, table_name)
+        columns = ensure_table_exists(engine, table_name)
         table_sql = quote_identifier(engine, table_name)
-        sql = f"select * from {table_sql} limit :limit offset :offset"
+        order_sql = table_order_sql(engine, columns, sort_by, sort_dir)
+        sql = f"select * from {table_sql}{order_sql} limit :limit offset :offset"
 
         with engine.connect() as sql_connection:
             fetched_rows = sql_connection.execute(text(sql), {"limit": limit + 1, "offset": offset}).fetchall()
@@ -129,7 +143,7 @@ def run_query(payload: SqlQueryRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Only SELECT/WITH queries are allowed here")
 
     sql = payload.sql.strip().rstrip(";")
-    limited_sql = f"select * from ({sql}) as visual_query limit :__limit offset :__offset"
+    validate_query_sql(sql)
     params = dict(payload.params)
     params["__limit"] = payload.limit + 1
     params["__offset"] = payload.offset
@@ -137,6 +151,9 @@ def run_query(payload: SqlQueryRequest) -> dict[str, Any]:
     engine = create_sql_engine(payload.connection.sql_url)
     try:
         with engine.connect() as connection:
+            columns = query_columns(connection, sql, params)
+            order_sql = query_order_sql(engine, columns, payload.sort_by, payload.sort_dir)
+            limited_sql = f"select * from ({sql}) as visual_query{order_sql} limit :__limit offset :__offset"
             result = connection.execute(text(limited_sql), params)
             fetched_rows = result.fetchall()
             visible_rows = fetched_rows[: payload.limit]
@@ -149,6 +166,10 @@ def run_query(payload: SqlQueryRequest) -> dict[str, Any]:
             "loaded": payload.offset + len(visible_rows),
             "has_more": len(fetched_rows) > payload.limit,
         }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SQL execution failed: {exc}") from exc
     finally:
         engine.dispose()
 
@@ -253,6 +274,62 @@ def safe_inspect_list(fn: Any, table_name: str) -> list[dict[str, Any]]:
     except Exception:
         return []
     return value if isinstance(value, list) else []
+
+
+def validate_query_sql(sql: str) -> None:
+    clean_sql = sql.strip()
+    if not clean_sql:
+        raise HTTPException(status_code=400, detail="SQL 不能为空")
+
+    if INCOMPLETE_SQL_TAIL_RE.search(clean_sql):
+        raise HTTPException(status_code=400, detail="SQL 条件不完整，请补全字段、运算符和值")
+
+    match = BARE_WHERE_IDENTIFIER_RE.search(clean_sql)
+    if match:
+        column = readable_sql_identifier(match.group("column"))
+        if column.lower() not in SQL_BOOLEAN_LITERALS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"WHERE 条件不完整：字段 {column} 后缺少比较运算符和值，例如 where {column} = 1",
+            )
+
+
+def readable_sql_identifier(identifier: str) -> str:
+    return re.sub(r"\s+", "", identifier).strip('`"[]')
+
+
+def table_order_sql(engine: Engine, columns: list[dict[str, Any]], sort_by: str | None, sort_dir: str) -> str:
+    if not sort_by:
+        return ""
+
+    column_names = {column["name"] for column in columns}
+    if sort_by not in column_names:
+        raise HTTPException(status_code=404, detail=f"Column not found: {sort_by}")
+
+    direction = sort_dir.lower()
+    if direction not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail="Invalid sort direction")
+
+    return f" order by {quote_identifier(engine, sort_by)} {direction}"
+
+
+def query_columns(connection: Any, sql: str, params: dict[str, Any]) -> list[str]:
+    result = connection.execute(text(f"select * from ({sql}) as visual_query where 1 = 0"), params)
+    return list(result.keys())
+
+
+def query_order_sql(engine: Engine, columns: list[str], sort_by: str | None, sort_dir: str) -> str:
+    if not sort_by:
+        return ""
+
+    if sort_by not in columns:
+        raise HTTPException(status_code=404, detail=f"Column not found: {sort_by}")
+
+    direction = sort_dir.lower()
+    if direction not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail="Invalid sort direction")
+
+    return f" order by {quote_identifier(engine, sort_by)} {direction}"
 
 
 def load_table_stats(engine: Engine, table_names: list[str]) -> dict[str, dict[str, Any]]:

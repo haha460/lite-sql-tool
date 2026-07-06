@@ -10,6 +10,7 @@ from sqlalchemy import inspect, text
 from app.dto.database import ConnectionInfo
 from app.plugin.database_client import create_sql_engine, row_to_dict
 from app.service.database_service import safe_inspect_list
+from app.service.database_skill_service import load_database_skill
 
 
 SELECT_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
@@ -20,6 +21,22 @@ MAX_HISTORY_MESSAGES = 12
 
 
 def build_sql_planner_prompt(schema: dict[str, Any]) -> str:
+    database_skill = schema.get("database_skill")
+    schema_for_prompt = schema
+    skill_prompt = ""
+    if isinstance(database_skill, dict) and database_skill.get("content"):
+        schema_for_prompt = {
+            **schema,
+            "database_skill": {key: value for key, value in database_skill.items() if key != "content"},
+        }
+        skill_label = "上传绑定的数据库 Skill" if database_skill.get("type") == "uploaded_skill" else "数据库 Skill/业务说明文档"
+        skill_prompt = (
+            "\n\n当前数据库已匹配到数据库 Skill/业务说明文档。"
+            "它补充真实 schema 之外的业务口径、表含义、流程和查询注意事项。"
+            "生成 SQL 和解释时必须优先遵循该文档；如果文档与真实 schema 冲突，以真实 schema 的表字段为准，并说明差异。"
+            f"当前 Skill 类型：{skill_label}。数据库 Skill 文档如下：\n"
+            f"{database_skill['content']}"
+        )
     return (
         "你是嵌入在数据库管理工具里的数据分析助手。"
         "只能根据用户问题和给定 schema 生成安全的只读 SQL。"
@@ -28,7 +45,8 @@ def build_sql_planner_prompt(schema: dict[str, Any]) -> str:
         "回复必须是 JSON，不要使用 Markdown 代码块。"
         "JSON 格式：{\"answer\":\"简短中文说明\",\"sql\":\"SELECT ... 或 null\"}。"
         "数据库 schema 如下：\n"
-        f"{json.dumps(schema, ensure_ascii=False, default=str)}"
+        f"{json.dumps(schema_for_prompt, ensure_ascii=False, default=str)}"
+        f"{skill_prompt}"
     )
 
 
@@ -104,7 +122,7 @@ def normalize_readonly_sql(sql: str) -> str:
     return clean_sql
 
 
-def load_schema(connection: ConnectionInfo) -> dict[str, Any]:
+def load_schema(connection: ConnectionInfo, database_skill: dict[str, Any] | None = None) -> dict[str, Any]:
     ensure_sql_enabled(connection)
     engine = create_sql_engine(connection.sql_url)
     try:
@@ -131,12 +149,16 @@ def load_schema(connection: ConnectionInfo) -> dict[str, Any]:
                     "foreign_keys": compact_foreign_keys(safe_inspect_list(inspector.get_foreign_keys, table_name)),
                 }
             )
-        return {
+        schema = {
             "dialect": engine.dialect.name,
             "table_count": len(inspector.get_table_names()),
             "truncated": len(inspector.get_table_names()) > MAX_SCHEMA_TABLES,
             "tables": tables,
         }
+        matched_skill = database_skill or load_database_skill(connection)
+        if matched_skill:
+            schema["database_skill"] = matched_skill
+        return schema
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to load schema: {exc}") from exc
     finally:

@@ -9,11 +9,13 @@ from app.dto.ai import (
     AiSessionLinksRequest,
     AiSessionLookupRequest,
     AiSessionRequest,
+    AiSkillUploadRequest,
     AiToolSchemaRequest,
     AiToolSelectRequest,
 )
 from app.api.ai_api import ai_api, ai_database_api, ai_session_api
 from app.model.ai_session import AiSession
+from app.service import ai_skill_service
 
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
@@ -78,6 +80,31 @@ def get_ai_messages(session_id: str) -> dict[str, Any]:
     return ai_session_api.session_response(session)
 
 
+@router.get("/sessions/{session_id}/skill")
+def get_ai_session_skill(session_id: str) -> dict[str, Any]:
+    session = ai_session_api.require_session(session_id)
+    skill = ai_skill_service.current_skill_for_session(session)
+    if not skill:
+        return {"skill": None}
+    return {"skill": {key: value for key, value in skill.items() if key != "content"}}
+
+
+@router.post("/skills/upload")
+async def upload_ai_skill(payload: AiSkillUploadRequest) -> dict[str, Any]:
+    session = ai_session_api.require_session(payload.session_id)
+    ai_api.ensure_ai_configured()
+    ai_database_api.ensure_sql_enabled(session.connection)
+    model_config = ai_api.get_model_config(payload.model_id)
+    result = await ai_skill_service.create_or_replace_skill(
+        session,
+        payload.filename,
+        payload.content,
+        model_config,
+    )
+    ai_session_api.save_session(session)
+    return result
+
+
 @router.post("/chat")
 async def ai_chat(payload: AiChatRequest) -> dict[str, Any]:
     session = ai_session_api.require_session(payload.session_id)
@@ -97,7 +124,7 @@ async def ai_chat(payload: AiChatRequest) -> dict[str, Any]:
 @router.post("/tool/schema")
 def ai_tool_schema(payload: AiToolSchemaRequest) -> dict[str, Any]:
     session = ai_session_api.require_session(payload.session_id)
-    return ai_database_api.load_schema(session.connection)
+    return ai_database_api.load_schema(session.connection, ai_skill_service.current_skill_for_session(session))
 
 
 @router.post("/tool/select")

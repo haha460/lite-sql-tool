@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 VENV_DIR="${VENV_DIR:-.venv}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
+AUTO_PORT="${AUTO_PORT:-1}"
 FORCE_INSTALL="${FORCE_INSTALL:-0}"
 REQ_STAMP="$VENV_DIR/.requirements.sha256"
 
@@ -74,6 +75,54 @@ print(sha256(Path("requirements.txt").read_bytes()).hexdigest())
 PY
 }
 
+port_is_free() {
+  local host="$1"
+  local port="$2"
+  "$PY" - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.settimeout(0.2)
+    try:
+        sock.bind((host, port))
+    except OSError:
+        raise SystemExit(1)
+PY
+}
+
+pick_port() {
+  local host="$1"
+  local requested_port="$2"
+  local port="$requested_port"
+  local max_port=$((requested_port + 20))
+
+  if port_is_free "$host" "$port"; then
+    printf '%s\n' "$port"
+    return
+  fi
+
+  if [ "$AUTO_PORT" != "1" ]; then
+    echo "Port $host:$requested_port is already in use. Set PORT=... or AUTO_PORT=1." >&2
+    exit 1
+  fi
+
+  echo "==> Port $host:$requested_port is in use, looking for a free port" >&2
+  port=$((requested_port + 1))
+  while [ "$port" -le "$max_port" ]; do
+    if port_is_free "$host" "$port"; then
+      printf '%s\n' "$port"
+      return
+    fi
+    port=$((port + 1))
+  done
+
+  echo "Cannot find a free port in range $requested_port-$max_port" >&2
+  exit 1
+}
+
 CURRENT_REQ_HASH="$(requirements_hash)"
 INSTALLED_REQ_HASH=""
 if [ -f "$REQ_STAMP" ]; then
@@ -92,8 +141,10 @@ if [ ! -f "app.db" ]; then
   echo "==> Creating demo database: app.db"
   "$PY" scripts/create_demo_db.py
 else
-  echo "==> Demo database exists: app.db"
+echo "==> Demo database exists: app.db"
 fi
+
+PORT="$(pick_port "$HOST" "$PORT")"
 
 echo "==> Starting server"
 echo "==> Open http://$HOST:$PORT"

@@ -52,8 +52,10 @@ def get_table_rows(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     include_total: bool = Query(default=False),
+    sort_by: str | None = Query(default=None),
+    sort_dir: str = Query(default="asc"),
 ) -> dict[str, Any]:
-    return database_api.get_table_rows(table_name, connection, limit, offset, include_total)
+    return database_api.get_table_rows(table_name, connection, limit, offset, include_total, sort_by, sort_dir)
 
 
 @router.post("/api/query")

@@ -35,6 +35,8 @@ class DatabaseApi(Protocol):
         limit: int,
         offset: int,
         include_total: bool,
+        sort_by: str | None = None,
+        sort_dir: str = "asc",
     ) -> dict[str, Any]: ...
 
     def run_query(self, payload: SqlQueryRequest) -> dict[str, Any]: ...

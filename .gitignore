@@ -15,6 +15,7 @@ log/
 
 # AI assistant local runtime and secrets
 .runtime/
+.skill/
 .opencode/local/
 opencode.local.json
 ai_sessions.db

@@ -125,6 +125,23 @@ export AI_AGENT_BACKEND=direct
 
 直连模式由 FastAPI 后端读取当前数据库 schema，让模型生成只读 SQL，再由后端执行 `SELECT` / `WITH` 查询并让模型总结结果。
 
+## 数据库 Skill
+
+AI 助手支持从前端上传数据库业务文档，由模型转换为 Skill Markdown 后一键导入本地 `.skill/` 目录，并绑定到当前数据库会话和数据库名。再次上传会为该数据库生成新的 Skill，并替换后续会话使用的绑定。
+
+绑定后的 Skill 会优先使用；如果当前会话没有上传绑定，后端会从 SQL 连接串解析数据库名，并优先查找 `数据库/<数据库名>.md`，再查找 `docs/<数据库名>.md`；例如连接到 `charge` 数据库时，会自动加载 `.skill/charge.skill.md`、`数据库/charge.md` 或 `docs/charge.md`。
+
+数据库 Skill 会随 `/api/ai/tool/schema` 返回，并在直连模式的系统提示词中注入。OpenCode 模式下，`db-analyst` 会读取 `db_schema` 返回的 `database_skill` 字段，用它补充表含义、业务流程、指标口径和查询注意事项。
+
+使用约定：
+
+- 前端上传支持 `.md`、`.txt`、`.sql`、`.json`、`.yaml`、`.yml`、`.csv` 文本文件。
+- 上传生成的 Skill 保存在 `.skill/<数据库名>.skill.md`，绑定关系保存在 `.runtime/ai_skill_bindings.json`。
+- 手工兜底 Markdown 文件可放在 `数据库/` 或 `docs/` 目录，文件名与数据库名一致。
+- 文档用于描述业务口径、表关系、典型查询和产出规则。
+- SQL 生成仍以实时 schema 的表字段为准；如果 Markdown 与真实 schema 冲突，AI 应说明差异。
+- 当前单个数据库 Skill 最多注入约 30000 字符，超出会截断。
+
 也可以切换为 OpenCode 后端 Agent 模式：
 
 ```bash

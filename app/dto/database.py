@@ -34,6 +34,8 @@ class SqlQueryRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = Field(default=DEFAULT_QUERY_LIMIT, ge=1, le=1000)
     offset: int = Field(default=0, ge=0)
+    sort_by: str | None = None
+    sort_dir: str = "asc"
 
 
 class CellUpdateRequest(BaseModel):

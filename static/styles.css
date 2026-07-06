@@ -956,6 +956,40 @@ tbody tr:hover td {
   white-space: nowrap;
 }
 
+.th-sort-button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.th-label-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.th-sort-button:hover,
+.th-sort-button.active {
+  color: var(--text);
+}
+
+.th-sort-indicator {
+  flex: 0 0 14px;
+  width: 14px;
+  margin-left: 6px;
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1;
+  text-align: center;
+}
+
 .column-resize-handle {
   position: absolute;
   top: 0;
@@ -1179,6 +1213,31 @@ body.ai-panel-collapsed .ai-resize-handle {
   width: 100%;
   min-height: 36px;
   padding: 0 10px;
+}
+
+.ai-skill-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-skill-row button {
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+#aiSkillStatus {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#aiSkillStatus.bound {
+  color: var(--accent);
 }
 
 .ai-messages {

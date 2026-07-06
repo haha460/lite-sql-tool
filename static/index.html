@@ -93,6 +93,11 @@
       <div class="ai-controls">
         <select id="aiModelSelect" title="选择 AI 模型"></select>
         <select id="aiConnectionSelect" title="选择数据库连接"></select>
+        <div class="ai-skill-row">
+          <input id="aiSkillFile" class="hidden" type="file" accept=".md,.txt,.sql,.json,.yaml,.yml,.csv">
+          <button id="aiSkillUploadButton" type="button">上传 Skill 文档</button>
+          <span id="aiSkillStatus" title="当前数据库绑定的 Skill">未绑定 Skill</span>
+        </div>
       </div>
       <div id="aiMessageList" class="ai-messages"></div>
       <div id="aiSqlCard" class="ai-sql-card hidden">
