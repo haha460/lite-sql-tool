@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 
 from app.dto.ai import (
     AiChatRequest,
@@ -121,13 +122,92 @@ async def ai_chat(payload: AiChatRequest) -> dict[str, Any]:
     return {"message": assistant_message, "session_id": session.id}
 
 
+@router.post("/chat/stream")
+async def ai_chat_stream(payload: AiChatRequest) -> StreamingResponse:
+    session = ai_session_api.require_session(payload.session_id)
+    ai_api.ensure_ai_configured()
+    ai_database_api.ensure_sql_enabled(session.connection)
+    model_config = ai_api.get_model_config(payload.model_id)
+
+    user_message = payload.message.strip()
+    if ai_api.agent_backend() == "opencode":
+        events = ai_api.stream_chat_with_opencode(session, user_message, model_config)
+    else:
+        events = ai_api.stream_chat_with_direct_model(session, user_message, payload.limit, model_config)
+    return StreamingResponse(
+        ai_api.encode_chat_events(events),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/tool/schema")
 def ai_tool_schema(payload: AiToolSchemaRequest) -> dict[str, Any]:
     session = ai_session_api.require_session(payload.session_id)
-    return ai_database_api.load_schema(session.connection, ai_skill_service.current_skill_for_session(session))
+    schema = ai_database_api.load_schema(session.connection, ai_skill_service.current_skill_for_session(session))
+    ai_api.publish_stream_event(
+        session.id,
+        {
+            "type": "step",
+            "phase": "schema",
+            "title": "读取数据库结构",
+            "status": "done",
+            "detail": f"已加载 {len(schema.get('tables') or [])} 张表的字段、索引与约束信息"
+            + ("，并合并当前绑定 Skill" if schema.get("database_skill") else ""),
+        },
+    )
+    return schema
 
 
 @router.post("/tool/select")
 def ai_tool_select(payload: AiToolSelectRequest) -> dict[str, Any]:
     session = ai_session_api.require_session(payload.session_id)
-    return ai_database_api.execute_readonly_sql(session.connection, payload.sql, payload.limit)
+    sql_index = ai_api.next_stream_sql_index(session.id)
+    sql_phase = f"sql:{sql_index}"
+    ai_api.publish_stream_event(
+        session.id,
+        {
+            "type": "step",
+            "phase": sql_phase,
+            "title": "执行只读 SQL",
+            "status": "running",
+            "detail": "正在向当前数据库连接提交只读查询",
+            "sql": payload.sql,
+            "sql_index": sql_index,
+        },
+    )
+    try:
+        result = ai_database_api.execute_readonly_sql(session.connection, payload.sql, payload.limit)
+    except Exception as exc:
+        ai_api.publish_stream_event(
+            session.id,
+            {
+                "type": "step",
+                "phase": sql_phase,
+                "title": "执行只读 SQL",
+                "status": "error",
+                "detail": "SQL 执行失败，可展开查看语句与错误信息",
+                "sql": payload.sql,
+                "sql_index": sql_index,
+                "error": str(getattr(exc, "detail", exc)),
+            },
+        )
+        raise
+    ai_api.publish_stream_event(
+        session.id,
+        {
+            "type": "step",
+            "phase": sql_phase,
+            "title": "执行只读 SQL",
+            "status": "done",
+            "detail": "SQL 已执行完成，可展开查看完整语句",
+            "sql": result.get("sql") or payload.sql,
+            "sql_index": sql_index,
+            "row_count": len(result.get("rows") or []),
+            "truncated": bool(result.get("truncated")),
+        },
+    )
+    return result

@@ -45,6 +45,8 @@
         <div class="toolbar-actions">
           <button id="addRowButton" type="button" disabled>新增行</button>
           <button id="deleteRowsButton" type="button" disabled>删除选中</button>
+          <button id="copySelectionButton" type="button" disabled>复制选区</button>
+          <button id="exportSelectionButton" type="button" disabled>导出选区</button>
           <button id="commitButton" type="button" disabled>提交更新</button>
           <button id="refreshButton" type="button" title="刷新">刷新</button>
         </div>
@@ -105,7 +107,7 @@
           <span>生成的 SQL</span>
           <button id="aiUseSqlButton" type="button">放入编辑器</button>
         </div>
-        <pre id="aiSqlText"></pre>
+        <div id="aiSqlText"></div>
       </div>
       <form id="aiForm" class="ai-form">
         <textarea id="aiPrompt" rows="3" placeholder="例如：分析 users 表的活跃用户情况" spellcheck="false"></textarea>

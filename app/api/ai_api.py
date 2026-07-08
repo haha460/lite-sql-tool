@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from app.dto.database import ConnectionInfo
@@ -38,6 +39,27 @@ class AiApi(Protocol):
         user_message: str,
         model_config: dict[str, str],
     ) -> dict[str, Any]: ...
+
+    async def stream_chat_with_direct_model(
+        self,
+        session: AiSession,
+        user_message: str,
+        limit: int,
+        model_config: dict[str, str],
+    ): ...
+
+    async def stream_chat_with_opencode(
+        self,
+        session: AiSession,
+        user_message: str,
+        model_config: dict[str, str],
+    ): ...
+
+    def publish_stream_event(self, session_id: str, payload: dict[str, Any]) -> None: ...
+
+    def next_stream_sql_index(self, session_id: str) -> int: ...
+
+    def encode_chat_events(self, events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[str]: ...
 
 
 class AiDatabaseApi(Protocol):

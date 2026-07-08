@@ -16,6 +16,17 @@ const state = {
   pendingInserts: [],
   pendingDeletes: new Map(),
   selectedRowKeys: new Set(),
+  highlightedRowKeys: new Set(),
+  isDraggingRowHighlight: false,
+  cellSelection: null,
+  isDraggingCellSelection: false,
+  cellSelectionPointer: null,
+  cellSelectionScrollFrame: 0,
+  cellSelectionRenderFrame: 0,
+  cellTooltipTimer: 0,
+  cellTooltipHideTimer: 0,
+  cellTooltipCell: null,
+  cellTooltipElement: null,
   queryMode: false,
   activeQuery: null,
   gridColumns: [],
@@ -36,6 +47,7 @@ const state = {
   aiSkillBusy: false,
   aiSkill: null,
   aiLastSql: "",
+  aiSqlList: [],
   aiModelId: sessionStorage.getItem("sqlRedisVisualAiModelId") || null,
   aiPanelCollapsed: localStorage.getItem("sqlRedisVisualAiPanelCollapsed") === "1",
   aiRestoreRequestId: 0,
@@ -62,6 +74,10 @@ const VIRTUAL_ROW_HEIGHT = 38;
 const VIRTUAL_OVERSCAN_ROWS = 10;
 const VIRTUAL_BOTTOM_PADDING = 72;
 const LOAD_MORE_BOTTOM_THRESHOLD = 12;
+const CELL_SELECTION_SCROLL_EDGE = 72;
+const CELL_SELECTION_MAX_SCROLL_SPEED = 44;
+const CELL_TOOLTIP_DELAY = 1000;
+const CELL_TOOLTIP_HIDE_DELAY = 500;
 const SQL_AUTOCOMPLETE_LIMIT = 80;
 const SQL_AUTOCOMPLETE_KEYWORDS = [
   "select",
@@ -175,6 +191,8 @@ const els = {
   viewMeta: document.querySelector("#viewMeta"),
   addRowButton: document.querySelector("#addRowButton"),
   deleteRowsButton: document.querySelector("#deleteRowsButton"),
+  copySelectionButton: document.querySelector("#copySelectionButton"),
+  exportSelectionButton: document.querySelector("#exportSelectionButton"),
   commitButton: document.querySelector("#commitButton"),
   refreshButton: document.querySelector("#refreshButton"),
   sqlEditor: document.querySelector("#sqlEditor"),
@@ -775,7 +793,11 @@ function renderAiMessages() {
     content.className = "ai-message-content";
     if (message.role === "assistant") {
       content.classList.add("markdown");
-      content.appendChild(renderMarkdown(message.content || ""));
+      if (Array.isArray(message.steps) && message.steps.length > 0) {
+        content.appendChild(renderAiStageResult(message));
+      } else {
+        content.appendChild(renderMarkdown(message.content || ""));
+      }
     } else {
       content.textContent = message.content || "";
     }
@@ -785,10 +807,178 @@ function renderAiMessages() {
   els.aiMessageList.scrollTop = els.aiMessageList.scrollHeight;
 }
 
-function showAiSql(sql) {
-  state.aiLastSql = sql || "";
-  els.aiSqlText.textContent = state.aiLastSql;
-  els.aiSqlCard.classList.toggle("hidden", !state.aiLastSql);
+function renderAiStageResult(message) {
+  const wrap = document.createElement("div");
+  wrap.className = "ai-stage-result";
+  const status = document.createElement("div");
+  status.className = `ai-stage-status ${message.streaming ? "running" : "done"}`;
+  status.textContent = message.streaming ? "分析中" : "已完成";
+  wrap.appendChild(status);
+
+  const stages = document.createElement("div");
+  stages.className = "ai-stage-list";
+  const latestRunningSqlPhase = latestAiSqlPhase(message.steps, "running");
+  const latestErrorSqlPhase = latestAiSqlPhase(message.steps, "error");
+  message.steps.forEach((step) => {
+    stages.appendChild(renderAiStage(step, {
+      streaming: message.streaming,
+      latestRunningSqlPhase,
+      latestErrorSqlPhase,
+    }));
+  });
+  wrap.appendChild(stages);
+
+  const final = document.createElement("section");
+  final.className = "ai-final-result";
+  const heading = document.createElement("h3");
+  heading.textContent = message.streaming ? "正在生成最终结果" : "分析结果";
+  final.appendChild(heading);
+  const body = document.createElement("div");
+  body.appendChild(renderMarkdown(message.content || (message.streaming ? "请稍候..." : "没有返回内容")));
+  final.appendChild(body);
+  wrap.appendChild(final);
+  return wrap;
+}
+
+function renderAiStage(step, options = {}) {
+  const hasDetails = Boolean(step.sql || step.detail || step.error || step.row_count !== undefined);
+  const details = document.createElement("details");
+  details.className = `ai-stage ${step.status || "running"}`;
+  details.open = shouldOpenAiStage(step, options);
+  const summary = document.createElement("summary");
+  const icon = document.createElement("span");
+  icon.className = "ai-stage-icon";
+  icon.textContent = aiStageIcon(step);
+  const title = document.createElement("span");
+  title.className = "ai-stage-title";
+  title.textContent = step.title || aiStageTitle(step.phase);
+  const meta = document.createElement("span");
+  meta.className = "ai-stage-meta";
+  meta.textContent = aiStageMeta(step);
+  summary.append(icon, title, meta);
+  details.appendChild(summary);
+
+  if (hasDetails) {
+    const body = document.createElement("div");
+    body.className = "ai-stage-body";
+    if (step.detail) {
+      const detail = document.createElement("p");
+      detail.textContent = step.detail;
+      body.appendChild(detail);
+    }
+    if (step.sql) {
+      const sqlHeader = document.createElement("div");
+      sqlHeader.className = "ai-stage-sql-header";
+      const sqlLabel = document.createElement("span");
+      sqlLabel.className = "ai-stage-sql-label";
+      sqlLabel.textContent = step.sql_index ? `使用的 SQL ${step.sql_index}` : "使用的 SQL";
+      const copyButton = document.createElement("button");
+      copyButton.className = "ai-stage-copy-sql";
+      copyButton.type = "button";
+      copyButton.textContent = "复制";
+      copyButton.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        try {
+          await writeClipboardText(step.sql);
+          setMessage("SQL 已复制");
+        } catch (error) {
+          setMessage(`复制失败：${error.message}`, true);
+        }
+      });
+      sqlHeader.append(sqlLabel, copyButton);
+      body.appendChild(sqlHeader);
+      const pre = document.createElement("pre");
+      pre.className = "ai-stage-sql";
+      pre.textContent = step.sql;
+      body.appendChild(pre);
+    }
+    if (step.row_count !== undefined) {
+      const rows = document.createElement("p");
+      rows.textContent = `${step.row_count} 行${step.truncated ? "，结果已截断" : ""}`;
+      body.appendChild(rows);
+    }
+    if (step.error) {
+      const error = document.createElement("p");
+      error.className = "ai-stage-error";
+      error.textContent = step.error;
+      body.appendChild(error);
+    }
+    details.appendChild(body);
+  }
+  return details;
+}
+
+function latestAiSqlPhase(steps = [], status) {
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    const step = steps[index];
+    if (step?.sql && step.status === status) return step.phase;
+  }
+  return "";
+}
+
+function shouldOpenAiStage(step, options = {}) {
+  if (!step) return false;
+  if (step.status === "error") return step.phase === options.latestErrorSqlPhase || !step.sql;
+  if (step.sql && step.status === "running") return step.phase === options.latestRunningSqlPhase;
+  if (options.streaming && !step.sql && step.status === "running") return true;
+  return false;
+}
+
+function aiStageIcon(step) {
+  if (step.status === "error") return "!";
+  if (step.status === "done") return "✓";
+  return "•";
+}
+
+function aiStageTitle(phase) {
+  return {
+    schema: "解析业务数据与约束",
+    plan: "求解优化方案",
+    sql: "执行只读 SQL",
+    summary: "生成最终结果",
+  }[phase] || "处理阶段";
+}
+
+function aiStageMeta(step) {
+  if (step.status === "error") return "失败";
+  if (step.row_count !== undefined) return `${step.row_count} 行${step.truncated ? " · 已截断" : ""}`;
+  if (step.sql && step.status === "done") return "可展开查看";
+  if (step.status === "done") return "完成";
+  return "进行中";
+}
+
+function showAiSql(sqlOrList) {
+  const sqlList = Array.isArray(sqlOrList)
+    ? sqlOrList.filter((item) => sqlTextFromItem(item))
+    : (sqlOrList ? [sqlOrList] : []);
+  state.aiSqlList = sqlList;
+  state.aiLastSql = sqlTextFromItem(sqlList[sqlList.length - 1]) || "";
+  els.aiSqlText.textContent = "";
+  sqlList.forEach((sqlEntry, index) => {
+    const sql = sqlTextFromItem(sqlEntry);
+    const sqlItem = document.createElement("div");
+    sqlItem.className = "ai-sql-item";
+    const title = document.createElement("div");
+    title.className = "ai-sql-item-title";
+    title.textContent = `SQL ${sqlIndexFromItem(sqlEntry, index)}`;
+    const pre = document.createElement("pre");
+    pre.textContent = sql;
+    sqlItem.append(title, pre);
+    els.aiSqlText.appendChild(sqlItem);
+  });
+  els.aiSqlCard.classList.toggle("hidden", sqlList.length === 0);
+}
+
+function sqlTextFromItem(item) {
+  if (typeof item === "string") return item.trim();
+  if (item && typeof item.sql === "string") return item.sql.trim();
+  return "";
+}
+
+function sqlIndexFromItem(item, fallbackIndex) {
+  if (item && typeof item === "object" && item.sql_index) return item.sql_index;
+  return fallbackIndex + 1;
 }
 
 async function loadAiConfig() {
@@ -975,29 +1165,27 @@ async function submitAiMessage(event) {
   showAiSql("");
   els.aiPrompt.value = "";
   state.aiMessages.push({ role: "user", content: text });
-  state.aiMessages.push({ role: "assistant", content: "正在分析..." });
+  const assistantMessage = {
+    role: "assistant",
+    content: "正在分析...",
+    steps: [],
+    streaming: true,
+  };
+  state.aiMessages.push(assistantMessage);
   renderAiMessages();
 
   try {
     const sessionId = await ensureAiSession();
-    const data = await api("/api/ai/chat", {
-      method: "POST",
-      body: JSON.stringify({
-        session_id: sessionId,
-        message: text,
-        limit: Number(els.limitInput.value || QUERY_ROW_LIMIT),
-        model_id: state.aiModelId,
-      }),
+    await streamAiChat({
+      sessionId,
+      message: text,
+      assistantMessage,
+      limit: Number(els.limitInput.value || QUERY_ROW_LIMIT),
+      modelId: state.aiModelId,
     });
-    state.aiMessages.pop();
-    state.aiMessages.push({
-      role: "assistant",
-      content: data.message?.content || "没有返回内容",
-    });
-    showAiSql(data.message?.sql || "");
   } catch (error) {
-    state.aiMessages.pop();
-    state.aiMessages.push({ role: "assistant", content: error.message });
+    assistantMessage.streaming = false;
+    assistantMessage.content = error.message;
     if (/AI session not found/i.test(error.message) || /会话不存在/.test(error.message)) {
       await resetAiSession({ keepMessages: true });
     }
@@ -1006,6 +1194,126 @@ async function submitAiMessage(event) {
     renderAiMessages();
     updateAiControls();
   }
+}
+
+async function streamAiChat({ sessionId, message, assistantMessage, limit, modelId }) {
+  const response = await fetch("/api/ai/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session_id: sessionId,
+      message,
+      limit,
+      model_id: modelId,
+    }),
+  });
+  if (!response.ok || !response.body) {
+    const rawText = await response.text();
+    const data = rawText ? parseApiJson(rawText) : {};
+    throw new Error(apiErrorMessage(response, data, rawText));
+  }
+
+  await readSseStream(response.body, (event) => {
+    applyAiStreamEvent(assistantMessage, event);
+    renderAiMessages();
+  });
+}
+
+async function readSseStream(body, onEvent) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    let boundary = sseBoundaryIndex(buffer);
+    while (boundary.index >= 0) {
+      const rawEvent = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary.length);
+      const event = parseSseEvent(rawEvent);
+      if (event) onEvent(event);
+      boundary = sseBoundaryIndex(buffer);
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) {
+    const event = parseSseEvent(buffer);
+    if (event) onEvent(event);
+  }
+}
+
+function sseBoundaryIndex(buffer) {
+  const lf = buffer.indexOf("\n\n");
+  const crlf = buffer.indexOf("\r\n\r\n");
+  if (lf < 0) return { index: crlf, length: 4 };
+  if (crlf < 0) return { index: lf, length: 2 };
+  return lf < crlf ? { index: lf, length: 2 } : { index: crlf, length: 4 };
+}
+
+function parseSseEvent(rawEvent) {
+  const lines = rawEvent.split(/\r?\n/);
+  const dataLines = [];
+  let name = "message";
+  lines.forEach((line) => {
+    if (!line || line.startsWith(":")) return;
+    const [field, ...rest] = line.split(":");
+    const value = rest.join(":").replace(/^ /, "");
+    if (field === "event") name = value || name;
+    if (field === "data") dataLines.push(value);
+  });
+  if (dataLines.length === 0) return null;
+  const data = parseApiJson(dataLines.join("\n"));
+  return { name, data };
+}
+
+function applyAiStreamEvent(assistantMessage, event) {
+  const data = event.data || {};
+  if (event.name === "step" || data.type === "step") {
+    assistantMessage.steps = mergeAiMessageStep(assistantMessage.steps || [], data);
+    assistantMessage.content = assistantMessage.steps.length ? "正在分析全部数据..." : assistantMessage.content;
+    showAiSql(aiSqlListFromMessage(assistantMessage));
+    return;
+  }
+  if (event.name === "final" || data.type === "final") {
+    const message = data.message || {};
+    assistantMessage.content = message.content || "没有返回内容";
+    assistantMessage.steps = Array.isArray(message.steps) && message.steps.length > 0
+      ? message.steps
+      : assistantMessage.steps || [];
+    assistantMessage.sql = message.sql || "";
+    assistantMessage.result = message.result || null;
+    assistantMessage.streaming = false;
+    showAiSql(aiSqlListFromMessage(assistantMessage));
+    return;
+  }
+  if (event.name === "error" || data.type === "error") {
+    assistantMessage.content = data.message || "AI 流式响应失败";
+    assistantMessage.streaming = false;
+    return;
+  }
+  if (event.name === "done" || data.type === "done") {
+    assistantMessage.streaming = false;
+  }
+}
+
+function mergeAiMessageStep(steps, nextStep) {
+  const phase = nextStep.phase || `step-${steps.length + 1}`;
+  const merged = steps.filter((step) => step.phase !== phase);
+  merged.push({ ...nextStep, phase });
+  return merged;
+}
+
+function aiSqlListFromMessage(message) {
+  const sqlList = [];
+  (message.steps || []).forEach((step) => {
+    if (typeof step.sql === "string" && step.sql.trim()) {
+      sqlList.push({ sql: step.sql, sql_index: step.sql_index });
+    }
+  });
+  if (sqlList.length === 0 && typeof message.sql === "string" && message.sql.trim()) {
+    sqlList.push({ sql: message.sql, sql_index: 1 });
+  }
+  return sqlList;
 }
 
 function useAiSqlInEditor() {
@@ -1429,6 +1737,7 @@ function columnWidth(column) {
 }
 
 function defaultColumnWidth(column) {
+  if (column === "__rownum") return 42;
   if (column === "__select") return 42;
   return Math.min(360, Math.max(120, String(column).length * 12 + 44));
 }
@@ -1568,6 +1877,17 @@ function clearPendingChanges() {
   state.pendingDeletes.clear();
   state.selectedRowKeys.clear();
   updateCommitButton();
+}
+
+function clearRowHighlights() {
+  state.highlightedRowKeys.clear();
+  state.isDraggingRowHighlight = false;
+}
+
+function clearCellSelection() {
+  state.cellSelection = null;
+  state.isDraggingCellSelection = false;
+  updateCellSelectionView({ immediate: true });
 }
 
 function buildSqlUrlFromFields() {
@@ -1945,6 +2265,8 @@ function resetDataView() {
   state.isLoadingRows = false;
   state.queryMode = false;
   state.activeQuery = null;
+  clearRowHighlights();
+  clearCellSelection();
   clearPendingChanges();
   renderConnections();
   renderGrid([], [], false);
@@ -2597,6 +2919,8 @@ async function loadRows({ append = false } = {}) {
   const offset = append ? state.activeRealRowsLoaded : 0;
   if (!append) {
     clearPendingChanges();
+    clearRowHighlights();
+    clearCellSelection();
   }
   setMessage(append ? `正在继续加载 ${TABLE_ROW_LIMIT} 行数据...` : `正在加载前 ${TABLE_ROW_LIMIT} 行数据...`);
   try {
@@ -2750,6 +3074,8 @@ async function loadQueryRows({
     }
     if (!append) {
       clearPendingChanges();
+      clearRowHighlights();
+      clearCellSelection();
     }
 
     const editableQuery = Boolean(tableForQuery && data.columns.includes(tableForQuery.primary_key) && !isReadOnlyActive());
@@ -2832,6 +3158,7 @@ function renderGrid(columns, rows, editable, options = {}) {
 
   if (columns.length === 0) {
     state.gridDisplayColumnCount = 0;
+    updateExportSelectionButton();
     return;
   }
 
@@ -2841,7 +3168,10 @@ function renderGrid(columns, rows, editable, options = {}) {
   displayColumns.forEach((column, index) => {
     const col = document.createElement("col");
     col.dataset.colIndex = String(index);
-    col.style.width = `${columnWidth(column)}px`;
+    col.style.width = `${defaultColumnWidth(column)}px`;
+    if (column !== "__rownum" && column !== "__select") {
+      col.style.width = `${columnWidth(column)}px`;
+    }
     colgroup.appendChild(col);
   });
   els.table.prepend(colgroup);
@@ -2902,6 +3232,7 @@ function renderGrid(columns, rows, editable, options = {}) {
   } else {
     renderAllRows();
   }
+  updateExportSelectionButton();
 }
 
 function renderAllRows() {
@@ -3045,6 +3376,8 @@ function formatCellValue(value) {
 function createRowElement(columns, row, editable, rowIndex) {
   const tr = document.createElement("tr");
   tr.dataset.rowIndex = String(rowIndex);
+  tr.classList.toggle("highlight-row", isRowHighlighted(row, rowIndex));
+  tr.classList.toggle("selected-row", isRowSelected(row));
   if (row.__virtual) {
     tr.classList.add("virtual-row");
   } else if (state.activeTable?.primary_key && state.pendingDeletes.has(String(row[state.activeTable.primary_key]))) {
@@ -3052,7 +3385,9 @@ function createRowElement(columns, row, editable, rowIndex) {
   }
   const rowNumberCell = document.createElement("td");
   rowNumberCell.className = "row-number-column";
+  rowNumberCell.dataset.rowHandle = "true";
   rowNumberCell.textContent = row.__virtual ? "*" : String(rowIndex + 1);
+  rowNumberCell.title = "点击选中整行，按住拖动可连续选择";
   tr.appendChild(rowNumberCell);
 
   if (editable && state.activeTable?.primary_key) {
@@ -3065,15 +3400,19 @@ function createRowElement(columns, row, editable, rowIndex) {
     selectCell.appendChild(checkbox);
     tr.appendChild(selectCell);
   }
-  columns.forEach((column) => {
+  columns.forEach((column, columnIndex) => {
     const td = document.createElement("td");
+    td.dataset.selectableCell = "true";
+    td.dataset.rowIndex = String(rowIndex);
+    td.dataset.columnIndex = String(columnIndex);
+    td.classList.toggle("cell-selected", isCellSelected(rowIndex, columnIndex));
     const pendingChange = pendingChangeForCell(row, column);
     const rawValue = pendingChange ? pendingChange.value : row[column];
     td.textContent = formatCellValue(rawValue);
-    td.title = td.textContent;
+    td.dataset.tooltipValue = td.textContent;
 
     if (editable && canEditCell(row, column)) {
-      td.contentEditable = "true";
+      td.dataset.editableCell = "true";
       td.dataset.original = pendingChange ? pendingChange.original : td.textContent;
       td.dataset.column = column;
       td.dataset.primaryKeyValue = row.__virtual ? "" : String(row[state.activeTable.primary_key]);
@@ -3111,6 +3450,154 @@ function rowSelectionKey(row) {
   return String(primaryKeyValue);
 }
 
+function rowHighlightKey(row, rowIndex) {
+  if (!row) return null;
+  const primaryKey = state.activeTable?.primary_key;
+  if (!row.__virtual && primaryKey && row[primaryKey] !== undefined && row[primaryKey] !== null) {
+    return `pk:${String(row[primaryKey])}`;
+  }
+  if (row.__clientId) {
+    return `client:${row.__clientId}`;
+  }
+  return `index:${rowIndex}`;
+}
+
+function isRowHighlighted(row, rowIndex) {
+  const key = rowHighlightKey(row, rowIndex);
+  return key ? state.highlightedRowKeys.has(key) : false;
+}
+
+function setRowHighlight(row, rowIndex, highlighted) {
+  const key = rowHighlightKey(row, rowIndex);
+  if (!key) return;
+  if (highlighted) {
+    state.highlightedRowKeys.add(key);
+  } else {
+    state.highlightedRowKeys.delete(key);
+  }
+  const tr = els.tbody.querySelector(`tr[data-row-index="${rowIndex}"]`);
+  tr?.classList.toggle("highlight-row", highlighted);
+}
+
+function rowIndexForEventTarget(target) {
+  const tr = target.closest("tr[data-row-index]");
+  if (!tr) return null;
+  const rowIndex = Number(tr.dataset.rowIndex);
+  return Number.isInteger(rowIndex) ? rowIndex : null;
+}
+
+function normalizedCellSelection() {
+  const selection = state.cellSelection;
+  if (!selection) return null;
+  return {
+    rowStart: Math.min(selection.anchorRow, selection.focusRow),
+    rowEnd: Math.max(selection.anchorRow, selection.focusRow),
+    colStart: Math.min(selection.anchorCol, selection.focusCol),
+    colEnd: Math.max(selection.anchorCol, selection.focusCol),
+  };
+}
+
+function isCellSelected(rowIndex, columnIndex) {
+  const selection = normalizedCellSelection();
+  return Boolean(
+    selection &&
+    rowIndex >= selection.rowStart &&
+    rowIndex <= selection.rowEnd &&
+    columnIndex >= selection.colStart &&
+    columnIndex <= selection.colEnd
+  );
+}
+
+function updateCellSelectionView({ immediate = false } = {}) {
+  if (!immediate) {
+    if (state.cellSelectionRenderFrame) return;
+    state.cellSelectionRenderFrame = requestAnimationFrame(() => {
+      state.cellSelectionRenderFrame = 0;
+      renderCellSelectionView();
+    });
+    return;
+  }
+  if (state.cellSelectionRenderFrame) {
+    cancelAnimationFrame(state.cellSelectionRenderFrame);
+    state.cellSelectionRenderFrame = 0;
+  }
+  renderCellSelectionView();
+}
+
+function renderCellSelectionView() {
+  const selection = normalizedCellSelection();
+  els.tbody.querySelectorAll('td[data-selectable-cell="true"]').forEach((td) => {
+    const rowIndex = Number(td.dataset.rowIndex);
+    const columnIndex = Number(td.dataset.columnIndex);
+    td.classList.toggle(
+      "cell-selected",
+      Boolean(
+        selection &&
+        rowIndex >= selection.rowStart &&
+        rowIndex <= selection.rowEnd &&
+        columnIndex >= selection.colStart &&
+        columnIndex <= selection.colEnd
+      ),
+    );
+  });
+  updateExportSelectionButton();
+}
+
+function updateExportSelectionButton() {
+  const selection = normalizedCellSelection();
+  const disabled = !selection || state.gridColumns.length === 0 || state.activeRows.length === 0;
+  if (els.copySelectionButton) {
+    els.copySelectionButton.disabled = disabled;
+  }
+  if (els.exportSelectionButton) {
+    els.exportSelectionButton.disabled = disabled;
+  }
+}
+
+function selectableCellForEvent(event) {
+  return event.target.closest('td[data-selectable-cell="true"]');
+}
+
+function cellPositionFromElement(cell) {
+  const rowIndex = Number(cell.dataset.rowIndex);
+  const columnIndex = Number(cell.dataset.columnIndex);
+  if (!Number.isInteger(rowIndex) || !Number.isInteger(columnIndex)) return null;
+  return { rowIndex, columnIndex };
+}
+
+function setCellSelection(anchor, focus = anchor) {
+  state.cellSelection = {
+    anchorRow: anchor.rowIndex,
+    anchorCol: anchor.columnIndex,
+    focusRow: focus.rowIndex,
+    focusCol: focus.columnIndex,
+  };
+  updateCellSelectionView();
+}
+
+function extendCellSelection(position) {
+  if (!state.cellSelection) return;
+  if (state.cellSelection.focusRow === position.rowIndex && state.cellSelection.focusCol === position.columnIndex) return;
+  setCellSelection(
+    { rowIndex: state.cellSelection.anchorRow, columnIndex: state.cellSelection.anchorCol },
+    position,
+  );
+}
+
+function setRowCellSelection(anchorRowIndex, focusRowIndex = anchorRowIndex) {
+  const lastColumnIndex = state.gridColumns.length - 1;
+  if (lastColumnIndex < 0) return;
+  setCellSelection(
+    { rowIndex: anchorRowIndex, columnIndex: 0 },
+    { rowIndex: focusRowIndex, columnIndex: lastColumnIndex },
+  );
+}
+
+function extendRowCellSelection(rowIndex) {
+  if (!state.cellSelection) return;
+  setRowCellSelection(state.cellSelection.anchorRow, rowIndex);
+}
+
 function isRowSelected(row) {
   const key = rowSelectionKey(row);
   return key ? state.selectedRowKeys.has(key) : false;
@@ -3120,6 +3607,7 @@ function trackCellChange(td, row, column) {
   td.classList.remove("editing", "error");
   const nextValue = td.textContent;
   const original = td.dataset.original || "";
+  td.dataset.tooltipValue = nextValue;
 
   if (row.__virtual) {
     row[column] = nextValue;
@@ -3153,12 +3641,296 @@ function trackCellChange(td, row, column) {
   setMessage(`有 ${state.pendingChanges.size} 处修改待提交`);
 }
 
+function activeEditingCell() {
+  const activeElement = document.activeElement;
+  if (!activeElement?.closest) return null;
+  const td = activeElement.closest('td[contenteditable="true"]');
+  return td && els.tbody.contains(td) ? td : null;
+}
+
+function placeCaretAtEnd(element) {
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function startCellEdit(td) {
+  if (!td?.matches?.('td[data-editable-cell="true"]')) return;
+  const current = activeEditingCell();
+  if (current && current !== td) {
+    current.blur();
+  }
+  td.contentEditable = "true";
+  td.classList.add("editing");
+  td.focus({ preventScroll: true });
+  placeCaretAtEnd(td);
+}
+
+function finishCellEdit(td) {
+  if (!td) return;
+  const row = rowForEventTarget(td);
+  const column = td.dataset.column;
+  if (row && column) {
+    trackCellChange(td, row, column);
+  } else {
+    td.classList.remove("editing");
+  }
+  td.removeAttribute("contenteditable");
+}
+
 function rowForEventTarget(target) {
   const tr = target.closest("tr[data-row-index]");
   if (!tr) return null;
   const rowIndex = Number(tr.dataset.rowIndex);
   if (!Number.isInteger(rowIndex)) return null;
   return state.activeRows[rowIndex] || null;
+}
+
+function rowNumberCellForEvent(event) {
+  return event.target.closest('td[data-row-handle="true"]');
+}
+
+function highlightRowForEvent(event, options = {}) {
+  const cell = rowNumberCellForEvent(event);
+  if (!cell) return false;
+  const rowIndex = rowIndexForEventTarget(cell);
+  if (rowIndex === null) return false;
+  const row = state.activeRows[rowIndex];
+  if (!row) return false;
+  const highlighted = options.toggle ? !isRowHighlighted(row, rowIndex) : true;
+  setRowHighlight(row, rowIndex, highlighted);
+  return true;
+}
+
+function renderRowHighlights() {
+  els.tbody.querySelectorAll("tr.highlight-row").forEach((tr) => tr.classList.remove("highlight-row"));
+  state.highlightedRowKeys.clear();
+}
+
+function handleTableBodyPointerDown(event) {
+  if (event.button !== 0) return;
+  if (!rowNumberCellForEvent(event)) return;
+  renderRowHighlights();
+  if (!highlightRowForEvent(event)) return;
+  const rowIndex = rowIndexForEventTarget(event.target);
+  if (rowIndex !== null) {
+    setRowCellSelection(rowIndex);
+  }
+  state.isDraggingRowHighlight = true;
+  event.preventDefault();
+}
+
+function handleTableBodyPointerOver(event) {
+  if (!state.isDraggingRowHighlight || event.buttons !== 1) return;
+  if (highlightRowForEvent(event)) {
+    const rowIndex = rowIndexForEventTarget(event.target);
+    if (rowIndex !== null) {
+      extendRowCellSelection(rowIndex);
+    }
+  }
+}
+
+function finishRowHighlightDrag() {
+  state.isDraggingRowHighlight = false;
+}
+
+function handleCellSelectionPointerDown(event) {
+  if (event.button !== 0) return;
+  const cell = selectableCellForEvent(event);
+  if (!cell) return;
+  const editingCell = activeEditingCell();
+  if (editingCell) {
+    if (editingCell === cell) return;
+    editingCell.blur();
+  }
+  const position = cellPositionFromElement(cell);
+  if (!position) return;
+  setCellSelection(position);
+  state.isDraggingCellSelection = true;
+  state.cellSelectionPointer = { x: event.clientX, y: event.clientY };
+  startCellSelectionAutoScroll();
+  event.preventDefault();
+}
+
+function handleCellSelectionPointerOver(event) {
+  if (!state.isDraggingCellSelection || event.buttons !== 1 || !state.cellSelection) return;
+  state.cellSelectionPointer = { x: event.clientX, y: event.clientY };
+  const cell = selectableCellForEvent(event);
+  if (!cell) return;
+  const position = cellPositionFromElement(cell);
+  if (!position) return;
+  extendCellSelection(position);
+}
+
+function finishCellSelectionDrag() {
+  state.isDraggingCellSelection = false;
+  state.cellSelectionPointer = null;
+  stopCellSelectionAutoScroll();
+  updateCellSelectionView({ immediate: true });
+}
+
+function handleCellSelectionPointerMove(event) {
+  if (!state.isDraggingCellSelection) return;
+  state.cellSelectionPointer = { x: event.clientX, y: event.clientY };
+}
+
+function startCellSelectionAutoScroll() {
+  if (state.cellSelectionScrollFrame) return;
+  const tick = () => {
+    state.cellSelectionScrollFrame = 0;
+    if (!state.isDraggingCellSelection || !state.cellSelectionPointer) return;
+
+    const { dx, dy } = cellSelectionScrollDelta(state.cellSelectionPointer);
+    if (dx !== 0 || dy !== 0) {
+      els.tableWrap.scrollLeft += dx;
+      els.tableWrap.scrollTop += dy;
+      if (dy !== 0) {
+        scheduleVisibleRowsRender();
+      }
+      extendCellSelectionFromPointer();
+    }
+
+    state.cellSelectionScrollFrame = requestAnimationFrame(tick);
+  };
+  state.cellSelectionScrollFrame = requestAnimationFrame(tick);
+}
+
+function stopCellSelectionAutoScroll() {
+  if (!state.cellSelectionScrollFrame) return;
+  cancelAnimationFrame(state.cellSelectionScrollFrame);
+  state.cellSelectionScrollFrame = 0;
+}
+
+function cellSelectionScrollDelta(pointer) {
+  const rect = els.tableWrap.getBoundingClientRect();
+  return {
+    dx: edgeScrollDelta(pointer.x, rect.left, rect.right),
+    dy: edgeScrollDelta(pointer.y, rect.top, rect.bottom),
+  };
+}
+
+function edgeScrollDelta(position, start, end) {
+  if (start >= end) return 0;
+  if (position < start + CELL_SELECTION_SCROLL_EDGE) {
+    const ratio = Math.min(1, Math.max(0, (start + CELL_SELECTION_SCROLL_EDGE - position) / CELL_SELECTION_SCROLL_EDGE));
+    return -Math.ceil(ratio * CELL_SELECTION_MAX_SCROLL_SPEED);
+  }
+  if (position > end - CELL_SELECTION_SCROLL_EDGE) {
+    const ratio = Math.min(1, Math.max(0, (position - (end - CELL_SELECTION_SCROLL_EDGE)) / CELL_SELECTION_SCROLL_EDGE));
+    return Math.ceil(ratio * CELL_SELECTION_MAX_SCROLL_SPEED);
+  }
+  return 0;
+}
+
+function extendCellSelectionFromPointer() {
+  const pointer = state.cellSelectionPointer;
+  if (!pointer) return;
+  const rect = els.tableWrap.getBoundingClientRect();
+  const x = Math.min(rect.right - 2, Math.max(rect.left + 2, pointer.x));
+  const y = Math.min(rect.bottom - 2, Math.max(rect.top + 2, pointer.y));
+  const element = document.elementFromPoint(x, y);
+  const cell = element?.closest?.('td[data-selectable-cell="true"]');
+  if (!cell) return;
+  const position = cellPositionFromElement(cell);
+  if (position) {
+    extendCellSelection(position);
+  }
+}
+
+function selectedCellMatrix() {
+  const selection = normalizedCellSelection();
+  if (!selection) return null;
+  const columns = state.gridColumns.slice(selection.colStart, selection.colEnd + 1);
+  const rows = [];
+  for (let rowIndex = selection.rowStart; rowIndex <= selection.rowEnd; rowIndex += 1) {
+    const row = state.activeRows[rowIndex];
+    if (!row) continue;
+    rows.push(columns.map((column) => formatCellValue(row[column])));
+  }
+  return { columns, rows };
+}
+
+function exportSelectedCells() {
+  const matrix = selectedCellMatrix();
+  if (!matrix || matrix.columns.length === 0 || matrix.rows.length === 0) {
+    setMessage("请先框选需要导出的单元格", true);
+    return;
+  }
+  const lines = [matrix.columns, ...matrix.rows].map((row) => row.map(csvCell).join(","));
+  const blob = new Blob([`\uFEFF${lines.join("\n")}`], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${exportFileBaseName()}-selection.csv`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  setMessage(`已导出 ${matrix.rows.length} 行 × ${matrix.columns.length} 列`);
+}
+
+async function copySelectedCells() {
+  const matrix = selectedCellMatrix();
+  if (!matrix || matrix.columns.length === 0 || matrix.rows.length === 0) {
+    setMessage("请先框选需要复制的单元格", true);
+    return;
+  }
+  const text = tableText(matrix);
+  try {
+    await writeClipboardText(text);
+    setMessage(`已复制 ${matrix.rows.length} 行 × ${matrix.columns.length} 列`);
+  } catch (error) {
+    setMessage(`复制失败：${error.message}`, true);
+  }
+}
+
+async function writeClipboardText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const ok = document.execCommand("copy");
+  textarea.remove();
+  if (!ok) {
+    throw new Error("浏览器未允许写入剪贴板");
+  }
+}
+
+function tableText(matrix) {
+  return [matrix.columns, ...matrix.rows].map((row) => row.map(tsvCell).join("\t")).join("\n");
+}
+
+function tsvCell(value) {
+  return String(value ?? "").replace(/\r?\n/g, " ");
+}
+
+function handleDocumentCopyShortcut(event) {
+  if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "c") return;
+  if (!normalizedCellSelection()) return;
+  if (event.target.closest("input, textarea, [contenteditable='true']")) return;
+  event.preventDefault();
+  copySelectedCells();
+}
+
+function csvCell(value) {
+  const text = String(value ?? "");
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function exportFileBaseName() {
+  const source = state.activeTable?.name || (state.queryMode ? "query" : "selection");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${source}-${timestamp}`;
 }
 
 function handleTableBodyChange(event) {
@@ -3172,6 +3944,7 @@ function handleTableBodyChange(event) {
   } else {
     state.selectedRowKeys.delete(key);
   }
+  checkbox.closest("tr[data-row-index]")?.classList.toggle("selected-row", checkbox.checked);
   updateCommitButton();
 }
 
@@ -3184,10 +3957,7 @@ function handleTableBodyFocusIn(event) {
 function handleTableBodyFocusOut(event) {
   const td = event.target.closest('td[contenteditable="true"]');
   if (!td) return;
-  const row = rowForEventTarget(td);
-  const column = td.dataset.column;
-  if (!row || !column) return;
-  trackCellChange(td, row, column);
+  finishCellEdit(td);
 }
 
 function handleTableBodyKeyDown(event) {
@@ -3201,6 +3971,146 @@ function handleTableBodyKeyDown(event) {
     td.textContent = td.dataset.original || "";
     td.blur();
   }
+}
+
+function handleTableBodyDoubleClick(event) {
+  if (event.button !== 0) return;
+  const td = event.target.closest('td[data-editable-cell="true"]');
+  if (!td || !els.tbody.contains(td)) return;
+  hideCellTooltip();
+  event.preventDefault();
+  startCellEdit(td);
+}
+
+function ensureCellTooltip() {
+  if (state.cellTooltipElement) return state.cellTooltipElement;
+  const tooltip = document.createElement("div");
+  tooltip.className = "cell-tooltip hidden";
+  tooltip.addEventListener("pointerenter", () => {
+    clearCellTooltipTimers();
+  });
+  tooltip.addEventListener("pointerleave", scheduleHideCellTooltip);
+  document.body.appendChild(tooltip);
+  state.cellTooltipElement = tooltip;
+  return tooltip;
+}
+
+function cellTooltipForEvent(event) {
+  const cell = event.target.closest('td[data-tooltip-value]');
+  if (!cell || !els.tbody.contains(cell)) return null;
+  if (cell.matches('[contenteditable="true"], .row-number-column, .select-column')) return null;
+  return cell;
+}
+
+function handleCellTooltipPointerOver(event) {
+  const cell = cellTooltipForEvent(event);
+  if (!cell || cell === state.cellTooltipCell) return;
+  scheduleCellTooltip(cell);
+}
+
+function handleCellTooltipPointerOut(event) {
+  const cell = event.target.closest?.('td[data-tooltip-value]');
+  if (!cell || !els.tbody.contains(cell)) return;
+  const next = event.relatedTarget;
+  if (next && (cell.contains(next) || state.cellTooltipElement?.contains(next))) return;
+  scheduleHideCellTooltip();
+}
+
+function handleDocumentPointerDown(event) {
+  if (state.cellTooltipElement?.contains(event.target)) return;
+  hideCellTooltip();
+}
+
+function scheduleCellTooltip(cell) {
+  clearCellTooltipTimers();
+  state.cellTooltipCell = cell;
+  state.cellTooltipTimer = window.setTimeout(() => {
+    state.cellTooltipTimer = 0;
+    showCellTooltip(cell);
+  }, CELL_TOOLTIP_DELAY);
+}
+
+function scheduleHideCellTooltip() {
+  if (state.cellTooltipHideTimer) return;
+  if (state.cellTooltipTimer) {
+    clearTimeout(state.cellTooltipTimer);
+    state.cellTooltipTimer = 0;
+  }
+  state.cellTooltipHideTimer = window.setTimeout(() => {
+    state.cellTooltipHideTimer = 0;
+    if (state.cellTooltipElement?.matches(":hover")) return;
+    hideCellTooltip();
+  }, CELL_TOOLTIP_HIDE_DELAY);
+}
+
+function clearCellTooltipHideTimer() {
+  if (!state.cellTooltipHideTimer) return;
+  clearTimeout(state.cellTooltipHideTimer);
+  state.cellTooltipHideTimer = 0;
+}
+
+function clearCellTooltipTimers() {
+  if (state.cellTooltipTimer) {
+    clearTimeout(state.cellTooltipTimer);
+    state.cellTooltipTimer = 0;
+  }
+  clearCellTooltipHideTimer();
+}
+
+function hideCellTooltip(options = {}) {
+  if (!options.keepTimer) {
+    clearCellTooltipTimers();
+  }
+  state.cellTooltipCell = null;
+  state.cellTooltipElement?.classList.add("hidden");
+}
+
+function showCellTooltip(cell) {
+  if (!cell?.isConnected || cell.matches('[contenteditable="true"]')) return;
+  const value = cell.dataset.tooltipValue ?? cell.textContent ?? "";
+  if (!value.trim()) return;
+
+  const tooltip = ensureCellTooltip();
+  tooltip.textContent = "";
+  const content = document.createElement("pre");
+  content.className = "cell-tooltip-content";
+  const parsed = formatTooltipValue(value);
+  content.textContent = parsed.text;
+  tooltip.classList.toggle("json", parsed.type === "json");
+  tooltip.appendChild(content);
+  tooltip.classList.remove("hidden");
+  positionCellTooltip(tooltip, cell);
+}
+
+function formatTooltipValue(value) {
+  const text = String(value ?? "");
+  const trimmed = text.trim();
+  if (!trimmed) return { type: "text", text };
+  try {
+    const parsed = JSON.parse(trimmed);
+    return { type: "json", text: JSON.stringify(parsed, null, 2) };
+  } catch {
+    return { type: "text", text };
+  }
+}
+
+function positionCellTooltip(tooltip, cell) {
+  const gap = 10;
+  const margin = 12;
+  const cellRect = cell.getBoundingClientRect();
+  const tooltipRect = tooltip.getBoundingClientRect();
+  const maxLeft = window.innerWidth - tooltipRect.width - margin;
+  const maxTop = window.innerHeight - tooltipRect.height - margin;
+  let left = Math.min(Math.max(cellRect.left, margin), Math.max(margin, maxLeft));
+  let top = cellRect.bottom + gap;
+
+  if (top > maxTop && cellRect.top - tooltipRect.height - gap >= margin) {
+    top = cellRect.top - tooltipRect.height - gap;
+  }
+  top = Math.min(Math.max(top, margin), Math.max(margin, maxTop));
+
+  tooltip.style.left = `${Math.round(left)}px`;
+  tooltip.style.top = `${Math.round(top)}px`;
 }
 
 function selectedRows() {
@@ -3270,6 +4180,7 @@ function markSelectedRowsForDelete() {
 }
 
 function handleTableScroll() {
+  hideCellTooltip();
   if (state.gridVirtual) {
     scheduleVisibleRowsRender();
   } else {
@@ -3406,16 +4317,33 @@ els.refreshButton.addEventListener("click", async () => {
 els.runQueryButton.addEventListener("click", runQuery);
 els.addRowButton.addEventListener("click", addVirtualRow);
 els.deleteRowsButton.addEventListener("click", markSelectedRowsForDelete);
+els.copySelectionButton.addEventListener("click", () => copySelectedCells());
+els.exportSelectionButton.addEventListener("click", exportSelectedCells);
 els.commitButton.addEventListener("click", commitChanges);
 els.connectionForm.addEventListener("submit", addConnection);
 els.redisEnabled.addEventListener("change", () => setRedisEnabled(els.redisEnabled.checked));
 els.driverSelect.addEventListener("change", updateConnectionTypeFields);
 els.tableWrap.addEventListener("scroll", handleTableScroll);
 els.tableWrap.addEventListener("wheel", handleTableWheel, { passive: false });
+els.tbody.addEventListener("pointerdown", handleTableBodyPointerDown);
+els.tbody.addEventListener("pointerover", handleTableBodyPointerOver);
+els.tbody.addEventListener("pointerdown", handleCellSelectionPointerDown);
+els.tbody.addEventListener("pointerover", handleCellSelectionPointerOver);
+els.tbody.addEventListener("pointerover", handleCellTooltipPointerOver);
+els.tbody.addEventListener("pointerout", handleCellTooltipPointerOut);
 els.tbody.addEventListener("change", handleTableBodyChange);
+els.tbody.addEventListener("dblclick", handleTableBodyDoubleClick);
 els.tbody.addEventListener("focusin", handleTableBodyFocusIn);
 els.tbody.addEventListener("focusout", handleTableBodyFocusOut);
 els.tbody.addEventListener("keydown", handleTableBodyKeyDown);
+window.addEventListener("pointerup", finishRowHighlightDrag);
+window.addEventListener("pointerup", finishCellSelectionDrag);
+window.addEventListener("pointermove", handleCellSelectionPointerMove);
+window.addEventListener("blur", finishRowHighlightDrag);
+window.addEventListener("blur", finishCellSelectionDrag);
+window.addEventListener("resize", hideCellTooltip);
+document.addEventListener("pointerdown", handleDocumentPointerDown);
+document.addEventListener("keydown", handleDocumentCopyShortcut);
 els.newConnectionButton.addEventListener("click", () => openConnectionModal());
 els.closeConnectionModal.addEventListener("click", closeConnectionModal);
 els.cancelConnectionButton.addEventListener("click", closeConnectionModal);
