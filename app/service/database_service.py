@@ -151,15 +151,16 @@ def run_query(payload: SqlQueryRequest) -> dict[str, Any]:
     engine = create_sql_engine(payload.connection.sql_url)
     try:
         with engine.connect() as connection:
-            columns = query_columns(connection, sql, params)
+            columns = query_columns(connection, sql, params) if payload.sort_by else None
             order_sql = query_order_sql(engine, columns, payload.sort_by, payload.sort_dir)
             limited_sql = f"select * from ({sql}) as visual_query{order_sql} limit :__limit offset :__offset"
             result = connection.execute(text(limited_sql), params)
+            result_columns = list(result.keys())
             fetched_rows = result.fetchall()
             visible_rows = fetched_rows[: payload.limit]
 
         return {
-            "columns": list(result.keys()),
+            "columns": result_columns,
             "rows": [row_to_dict(row) for row in visible_rows],
             "limit": payload.limit,
             "offset": payload.offset,
@@ -318,7 +319,7 @@ def query_columns(connection: Any, sql: str, params: dict[str, Any]) -> list[str
     return list(result.keys())
 
 
-def query_order_sql(engine: Engine, columns: list[str], sort_by: str | None, sort_dir: str) -> str:
+def query_order_sql(engine: Engine, columns: list[str] | None, sort_by: str | None, sort_dir: str) -> str:
     if not sort_by:
         return ""
 

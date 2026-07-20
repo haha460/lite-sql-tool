@@ -55,6 +55,19 @@ postgresql+psycopg://user:password@localhost:5432/app
 - IP/Port 模式：填写 Driver、IP/Host、端口、用户名、密码、数据库名后自动生成 SQL URL
 - Redis-only 模式：Driver 选择 Redis 时只保存 Redis 连接，不展示 SQL 表
 - 只读连接：勾选后仍可浏览和查询 SQL，但后端会拒绝新增、修改、删除操作
+- 所属分组：弹窗里可以直接选择连接归属的分组，默认放入「默认分组」
+
+## 连接分组
+
+左侧连接列表支持按分组组织，方便管理多个数据库连接。
+
+- 分组信息和连接一起保存在后端本机 `.runtime/connections.json`（结构为 `{version, groups, connections}`），每个连接带一个 `groupId`。
+- 始终存在一个「默认分组」，不能删除但可以重命名；所有未归组的连接都会落在默认分组下。
+- 点击连接区右上角的「新建分组」创建分组；分组标题旁的按钮可以重命名或删除分组。
+- 归组方式有两种：把连接直接拖拽到目标分组，或在新建/编辑连接的弹窗里用「所属分组」下拉框选择。
+- 删除一个分组时，只删除分组本身，组内连接会自动移动到默认分组，连接不会丢失。
+- 分组的展开 / 收起状态保存在浏览器 `localStorage`，刷新或重新打开页面后保持不变。
+- 旧版本的 `.runtime/connections.json`（没有 `groups` 字段的连接列表）会自动兼容：读取时给每个连接补上默认分组，首次保存后升级为新格式。
 
 ## AI 助手配置
 
@@ -168,20 +181,42 @@ export OPENCODE_RESPONSE_TRANSPORT=poll
 
 ## 启动 Web 项目
 
-一键启动：
+`start.sh` 是后台服务管理脚本，支持启动、停止、重启和查看状态：
 
 ```bash
 chmod +x start.sh
-./start.sh
+./start.sh          # 等价于 ./start.sh start，后台启动
+./start.sh status   # 查看运行状态、PID、端口
+./start.sh stop     # 停止（先发 TERM，最多等 10 秒，再 KILL 兜底）
+./start.sh restart  # 重启
 ```
 
-脚本会缓存 `requirements.txt` 的指纹，依赖没变化时会跳过安装，所以第二次启动会快很多。需要强制重装依赖时：
+后台启动后：
+
+- PID 写入 `log/app.pid`，实际端口写入 `log/app.port`；启动后会等待约 1.5 秒确认进程存活才报成功，失败时自动打印 `log/startup.log` 末尾并退出。
+- 脚本会缓存 `requirements.txt` 的指纹，依赖没变化时跳过安装，第二次启动更快。需要强制重装依赖时：`FORCE_INSTALL=1 ./start.sh`。
+- 演示 SQLite 数据库 `app.db` 不存在时会自动创建，端口被占用时默认在 `PORT` 基础上自动顺延查找空闲端口。
+
+需要前台运行（例如本地调试）：
 
 ```bash
-FORCE_INSTALL=1 ./start.sh
+FOREGROUND=1 ./start.sh
 ```
 
-也可以手动创建演示 SQLite 数据库并启动服务：
+常用环境变量：
+
+- `HOST` / `PORT`：监听地址和端口，默认 `127.0.0.1:8000`
+- `AUTO_PORT`：端口被占用时是否自动顺延，默认 `1`
+- `FORCE_INSTALL`：强制重装依赖，默认 `0`
+- `FOREGROUND`：前台运行，默认 `0`（后台）
+- `LOG_LEVEL`：uvicorn 日志级别，默认 `info`
+- `LOG_BACKUP_DAYS`：按天切分日志的保留天数，默认 `14`
+
+### 日志
+
+应用日志统一输出到 `log/app.log`，通过 uvicorn 的 `--log-config` 使用 `TimedRotatingFileHandler`，每天零点自动切分为 `log/app.log.YYYY-MM-DD`，默认保留最近 14 天（由 `LOG_BACKUP_DAYS` 控制）。uvicorn、错误和访问日志都汇入同一个按天切分的文件。`log/startup.log` 仅用于兜底捕获启动前的致命错误。`log/` 已加入 `.gitignore`，不会提交到 git。
+
+也可以手动创建演示 SQLite 数据库并直接用 uvicorn 前台启动（不带日志切分）：
 
 ```bash
 python scripts/create_demo_db.py
@@ -238,6 +273,7 @@ OPENCODE_PROVIDER=huayan
 - 本地保存：刷新或重新打开页面后显示已保存连接
 - 手动连接：点击连接名称后才真正连接数据库
 - 编辑连接：已保存连接旁边有编辑按钮，鼠标悬停会显示 SQL / Redis 连接信息
+- 连接分组：支持新建、重命名、删除分组，可拖拽连接或在弹窗里选择分组归组，展开状态本地保存
 - 支持同时打开不同数据库连接下的多个数据表 tab
 - 左侧每个数据库连接下拉展示自己的数据表，便于同时浏览多个数据库
 - 每个数据表可展开查看字段、外键、索引信息，并展示行数、估算标记和表大小

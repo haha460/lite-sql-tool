@@ -1,5 +1,10 @@
 const state = {
   connections: [],
+  groups: [],
+  collapsedGroupIds: new Set(),
+  dragConnectionId: null,
+  editingGroupId: null,
+  deletingGroupId: null,
   activeConnectionId: null,
   editingConnectionId: null,
   deletingConnectionId: null,
@@ -61,13 +66,17 @@ const state = {
 };
 
 const STORAGE_KEY = "sqlRedisVisualConnections";
+const GROUP_COLLAPSED_KEY = "sqlRedisVisualCollapsedGroups";
 const SIDEBAR_WIDTH_KEY = "sqlRedisVisualSidebarWidth";
 const COLUMN_WIDTHS_KEY = "sqlRedisVisualColumnWidths";
 const AI_SESSION_BY_CONNECTION_KEY = "sqlRedisVisualAiSessionByConnection";
 const AI_MODEL_KEY = "sqlRedisVisualAiModelId";
 const AI_PANEL_WIDTH_KEY = "sqlRedisVisualAiPanelWidth";
 const AI_PANEL_COLLAPSED_KEY = "sqlRedisVisualAiPanelCollapsed";
+const TOOLS_PANEL_COLLAPSED_KEY = "sqlRedisVisualToolsPanelCollapsed";
 const DEFAULT_REDIS_URL = "redis://localhost:6379/0";
+const DEFAULT_GROUP_ID = "default";
+const DEFAULT_GROUP_NAME = "默认分组";
 const TABLE_ROW_LIMIT = 100;
 const QUERY_ROW_LIMIT = 100;
 const VIRTUAL_ROW_HEIGHT = 38;
@@ -149,6 +158,7 @@ const SQL_RESERVED_WORDS = new Set([
 ]);
 
 state.aiSessionByConnection = loadAiSessionMap();
+state.collapsedGroupIds = loadCollapsedGroups();
 
 const els = {
   sqlStatus: document.querySelector("#sqlStatus"),
@@ -159,6 +169,18 @@ const els = {
   aiResizeHandle: document.querySelector("#aiResizeHandle"),
   aiOpenButton: document.querySelector("#aiOpenButton"),
   newConnectionButton: document.querySelector("#newConnectionButton"),
+  newGroupButton: document.querySelector("#newGroupButton"),
+  groupModal: document.querySelector("#groupModal"),
+  groupModalTitle: document.querySelector("#groupModalTitle"),
+  closeGroupModal: document.querySelector("#closeGroupModal"),
+  cancelGroupButton: document.querySelector("#cancelGroupButton"),
+  groupForm: document.querySelector("#groupForm"),
+  groupName: document.querySelector("#groupName"),
+  deleteGroupModal: document.querySelector("#deleteGroupModal"),
+  closeDeleteGroupModal: document.querySelector("#closeDeleteGroupModal"),
+  cancelDeleteGroupButton: document.querySelector("#cancelDeleteGroupButton"),
+  confirmDeleteGroupButton: document.querySelector("#confirmDeleteGroupButton"),
+  deleteGroupText: document.querySelector("#deleteGroupText"),
   connectionModal: document.querySelector("#connectionModal"),
   connectionModalTitle: document.querySelector("#connectionModalTitle"),
   closeConnectionModal: document.querySelector("#closeConnectionModal"),
@@ -170,6 +192,7 @@ const els = {
   deleteConnectionText: document.querySelector("#deleteConnectionText"),
   connectionForm: document.querySelector("#connectionForm"),
   connectionName: document.querySelector("#connectionName"),
+  connectionGroup: document.querySelector("#connectionGroup"),
   connectionMode: () => document.querySelector('input[name="connectionMode"]:checked')?.value || "dsn",
   dsnFields: document.querySelector("#dsnFields"),
   fieldInputs: document.querySelector("#fieldInputs"),
@@ -200,6 +223,36 @@ const els = {
   limitInput: document.querySelector("#limitInput"),
   runQueryButton: document.querySelector("#runQueryButton"),
   message: document.querySelector("#message"),
+  toolsPanel: document.querySelector(".tools-panel"),
+  toolsContent: document.querySelector("#toolsContent"),
+  toolsToggleButton: document.querySelector("#toolsToggleButton"),
+  toolTabs: Array.from(document.querySelectorAll(".tool-tab")),
+  toolPanes: Array.from(document.querySelectorAll(".tool-pane")),
+  timestampTool: document.querySelector(".timestamp-tool"),
+  timestampToolBody: document.querySelector("#timestampToolBody"),
+  currentTimestampSeconds: document.querySelector("#currentTimestampSeconds"),
+  copyCurrentTimestampButton: document.querySelector("#copyCurrentTimestampButton"),
+  timestampInput: document.querySelector("#timestampInput"),
+  timestampNowButton: document.querySelector("#timestampNowButton"),
+  timestampError: document.querySelector("#timestampError"),
+  timestampSecondsOutput: document.querySelector("#timestampSecondsOutput"),
+  timestampMillisecondsOutput: document.querySelector("#timestampMillisecondsOutput"),
+  timestampLocalOutput: document.querySelector("#timestampLocalOutput"),
+  timestampTimezoneOutput: document.querySelector("#timestampTimezoneOutput"),
+  timestampIsoOutput: document.querySelector("#timestampIsoOutput"),
+  timestampUtcOutput: document.querySelector("#timestampUtcOutput"),
+  datetimeInput: document.querySelector("#datetimeInput"),
+  datetimeNowButton: document.querySelector("#datetimeNowButton"),
+  datetimeError: document.querySelector("#datetimeError"),
+  datetimeSecondsOutput: document.querySelector("#datetimeSecondsOutput"),
+  datetimeMillisecondsOutput: document.querySelector("#datetimeMillisecondsOutput"),
+  jsonInput: document.querySelector("#jsonInput"),
+  jsonOutput: document.querySelector("#jsonOutput"),
+  jsonStatus: document.querySelector("#jsonStatus"),
+  jsonFormatButton: document.querySelector("#jsonFormatButton"),
+  jsonEscapeButton: document.querySelector("#jsonEscapeButton"),
+  jsonUnescapeButton: document.querySelector("#jsonUnescapeButton"),
+  jsonCopyButton: document.querySelector("#jsonCopyButton"),
   tabBar: document.querySelector("#tabBar"),
   tableWrap: document.querySelector(".table-wrap"),
   table: document.querySelector("#dataTable"),
@@ -2029,6 +2082,7 @@ function loadLegacyStoredConnections() {
     return parsed.map((connection) => ({
       ...connection,
       kind: connection.kind || "sql",
+      groupId: connection.groupId || DEFAULT_GROUP_ID,
       redisEnabled: Boolean(connection.redisEnabled),
       redisConnected: false,
       sqlConnected: false,
@@ -2043,36 +2097,87 @@ function normalizeStoredConnections(connections) {
   return connections.map((connection) => ({
     ...connection,
     kind: connection.kind || "sql",
+    groupId: connection.groupId || DEFAULT_GROUP_ID,
     redisEnabled: Boolean(connection.redisEnabled),
     redisConnected: false,
     sqlConnected: false,
   }));
 }
 
+function ensureDefaultGroup(groups) {
+  const list = Array.isArray(groups)
+    ? groups
+        .filter((group) => group && group.id && group.name)
+        .map((group) => ({ id: String(group.id), name: String(group.name) }))
+    : [];
+  const existingDefault = list.find((group) => group.id === DEFAULT_GROUP_ID);
+  const others = list.filter((group) => group.id !== DEFAULT_GROUP_ID);
+  return [{ id: DEFAULT_GROUP_ID, name: existingDefault ? existingDefault.name : DEFAULT_GROUP_NAME }, ...others];
+}
+
+function assignConnectionGroups(connections) {
+  const groupIds = new Set(state.groups.map((group) => group.id));
+  return connections.map((connection) => ({
+    ...connection,
+    groupId: groupIds.has(connection.groupId) ? connection.groupId : DEFAULT_GROUP_ID,
+  }));
+}
+
+function newGroupId() {
+  return crypto.randomUUID ? `grp-${crypto.randomUUID()}` : `grp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 function serializableConnections() {
-  const persisted = state.connections.map(({ tables, loadingTables, sqlConnected, redisConnected, redisError, ...connection }) => connection);
+  const persisted = state.connections.map(({ tables, loadingTables, sqlConnected, redisConnected, redisError, ...connection }) => ({
+    ...connection,
+    groupId: connection.groupId || DEFAULT_GROUP_ID,
+  }));
   return persisted;
+}
+
+function serializableGroups() {
+  return ensureDefaultGroup(state.groups).map((group) => ({ id: group.id, name: group.name }));
+}
+
+function loadCollapsedGroups() {
+  try {
+    const raw = localStorage.getItem(GROUP_COLLAPSED_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveCollapsedGroups() {
+  try {
+    localStorage.setItem(GROUP_COLLAPSED_KEY, JSON.stringify([...state.collapsedGroupIds]));
+  } catch {
+    // Ignore storage failures (private mode, quota, etc.).
+  }
 }
 
 async function loadStoredConnections() {
   try {
     const data = await api("/api/connections");
+    state.groups = ensureDefaultGroup(data.groups);
     const serverConnections = normalizeStoredConnections(data.connections);
     if (serverConnections.length > 0) {
       localStorage.removeItem(STORAGE_KEY);
-      return serverConnections;
+      return assignConnectionGroups(serverConnections);
     }
 
     const legacyConnections = loadLegacyStoredConnections();
     if (legacyConnections.length > 0) {
-      state.connections = legacyConnections;
+      state.connections = assignConnectionGroups(legacyConnections);
       await saveStoredConnections();
       localStorage.removeItem(STORAGE_KEY);
-      return legacyConnections;
+      return state.connections;
     }
     return [];
   } catch (error) {
     setMessage(`读取本地连接配置失败：${error.message}`, true);
+    state.groups = ensureDefaultGroup(state.groups);
     return loadLegacyStoredConnections();
   }
 }
@@ -2081,92 +2186,316 @@ async function saveStoredConnections() {
   const persisted = serializableConnections();
   await api("/api/connections", {
     method: "PUT",
-    body: JSON.stringify({ connections: persisted }),
+    body: JSON.stringify({ connections: persisted, groups: serializableGroups() }),
   });
 }
 
 function renderConnections() {
   els.connectionList.innerHTML = "";
+  const groups = state.groups.length ? state.groups : ensureDefaultGroup([]);
+  const groupIds = new Set(groups.map((group) => group.id));
+
+  const connectionsByGroup = new Map(groups.map((group) => [group.id, []]));
   state.connections.forEach((connection) => {
-    const item = document.createElement("details");
-    item.className = "connection-item";
-    item.open = state.expandedConnectionIds.has(connection.id);
-    item.addEventListener("toggle", () => {
-      if (item.open) {
-        state.expandedConnectionIds.add(connection.id);
-      } else {
-        state.expandedConnectionIds.delete(connection.id);
-      }
-    });
-    item.classList.toggle("active", connection.id === state.activeConnectionId);
-    item.title = isRedisOnly(connection)
-      ? `Redis: ${connection.redisUrl || DEFAULT_REDIS_URL}`
-      : `SQL: ${connection.sqlUrl}${connection.redisEnabled ? `\nRedis: ${connection.redisUrl || DEFAULT_REDIS_URL}` : ""}${connection.readonly ? "\n只读连接" : ""}`;
-
-    const summary = document.createElement("summary");
-    summary.className = "connection-summary";
-
-    const main = document.createElement("button");
-    main.type = "button";
-    main.className = "connection-main";
-
-    const badges = document.createElement("span");
-    badges.className = "connection-badges";
-
-    const sqlIcon = document.createElement("span");
-    sqlIcon.className = `connection-icon ${connectionIconClass(connection)}`;
-    sqlIcon.textContent = connectionIconText(connection);
-    sqlIcon.title = "SQL 数据库";
-    badges.appendChild(sqlIcon);
-
-    if (connection.redisEnabled) {
-      const redisIcon = document.createElement("span");
-      redisIcon.className = "connection-icon redis";
-      redisIcon.textContent = "R";
-      redisIcon.title = "Redis 数据库";
-      badges.appendChild(redisIcon);
-    }
-
-    const name = document.createElement("span");
-    name.className = "connection-name";
-    name.textContent = `${connection.name}${connection.readonly ? " (只读)" : ""}`;
-
-    const activeDot = document.createElement("span");
-    activeDot.className = "connection-active-dot";
-    activeDot.title = "数据库连接活跃";
-    activeDot.hidden = !connection.sqlConnected && !connection.redisConnected;
-
-    main.append(badges, name, activeDot);
-    main.addEventListener("click", (event) => {
-      event.preventDefault();
-      handleConnectionClick(connection.id);
-    });
-
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.className = "connection-edit";
-    edit.textContent = "编辑";
-    edit.addEventListener("click", (event) => {
-      event.preventDefault();
-      editConnection(connection.id);
-    });
-
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "connection-remove";
-    remove.textContent = "删除";
-    remove.addEventListener("click", (event) => {
-      event.preventDefault();
-      openDeleteConnectionModal(connection.id);
-    });
-
-    summary.append(main, edit, remove);
-    item.append(summary);
-    item.appendChild(renderConnectionTables(connection));
-    els.connectionList.appendChild(item);
+    const groupId = groupIds.has(connection.groupId) ? connection.groupId : DEFAULT_GROUP_ID;
+    connectionsByGroup.get(groupId).push(connection);
   });
+
+  groups.forEach((group) => {
+    els.connectionList.appendChild(renderConnectionGroup(group, connectionsByGroup.get(group.id) || []));
+  });
+
   updateConnectionStatusSummary();
   renderAiConnectionOptions();
+}
+
+function renderConnectionGroup(group, connections) {
+  const groupEl = document.createElement("details");
+  groupEl.className = "group-item";
+  groupEl.dataset.groupId = group.id;
+  groupEl.open = !state.collapsedGroupIds.has(group.id);
+  groupEl.addEventListener("toggle", () => {
+    if (groupEl.open) {
+      state.collapsedGroupIds.delete(group.id);
+    } else {
+      state.collapsedGroupIds.add(group.id);
+    }
+    saveCollapsedGroups();
+  });
+
+  const summary = document.createElement("summary");
+  summary.className = "group-summary";
+
+  const name = document.createElement("span");
+  name.className = "group-name";
+  name.textContent = group.name;
+
+  const count = document.createElement("span");
+  count.className = "group-count";
+  count.textContent = String(connections.length);
+
+  const actions = document.createElement("span");
+  actions.className = "group-actions";
+
+  const rename = document.createElement("button");
+  rename.type = "button";
+  rename.className = "group-rename";
+  rename.textContent = "重命名";
+  rename.title = "重命名分组";
+  rename.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openGroupModal(group);
+  });
+  actions.appendChild(rename);
+
+  if (group.id !== DEFAULT_GROUP_ID) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "group-delete";
+    remove.textContent = "删除";
+    remove.title = "删除分组";
+    remove.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openDeleteGroupModal(group);
+    });
+    actions.appendChild(remove);
+  }
+
+  summary.append(name, count, actions);
+  groupEl.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "group-body";
+  if (connections.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "group-empty";
+    empty.textContent = "拖拽连接到此分组";
+    body.appendChild(empty);
+  } else {
+    connections.forEach((connection) => body.appendChild(renderConnectionItem(connection)));
+  }
+  groupEl.appendChild(body);
+
+  setupGroupDropTarget(groupEl, group.id);
+  return groupEl;
+}
+
+function renderConnectionItem(connection) {
+  const item = document.createElement("details");
+  item.className = "connection-item";
+  item.dataset.connectionId = connection.id;
+  item.draggable = true;
+  item.open = state.expandedConnectionIds.has(connection.id);
+  item.addEventListener("toggle", () => {
+    if (item.open) {
+      state.expandedConnectionIds.add(connection.id);
+    } else {
+      state.expandedConnectionIds.delete(connection.id);
+    }
+  });
+  item.classList.toggle("active", connection.id === state.activeConnectionId);
+  item.title = isRedisOnly(connection)
+    ? `Redis: ${connection.redisUrl || DEFAULT_REDIS_URL}`
+    : `SQL: ${connection.sqlUrl}${connection.redisEnabled ? `\nRedis: ${connection.redisUrl || DEFAULT_REDIS_URL}` : ""}${connection.readonly ? "\n只读连接" : ""}`;
+
+  item.addEventListener("dragstart", (event) => {
+    state.dragConnectionId = connection.id;
+    item.classList.add("dragging");
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", connection.id);
+    }
+  });
+  item.addEventListener("dragend", () => {
+    state.dragConnectionId = null;
+    item.classList.remove("dragging");
+    document.querySelectorAll(".group-item.drop-target").forEach((el) => el.classList.remove("drop-target"));
+  });
+
+  const summary = document.createElement("summary");
+  summary.className = "connection-summary";
+
+  const main = document.createElement("button");
+  main.type = "button";
+  main.className = "connection-main";
+
+  const badges = document.createElement("span");
+  badges.className = "connection-badges";
+
+  const sqlIcon = document.createElement("span");
+  sqlIcon.className = `connection-icon ${connectionIconClass(connection)}`;
+  sqlIcon.textContent = connectionIconText(connection);
+  sqlIcon.title = "SQL 数据库";
+  badges.appendChild(sqlIcon);
+
+  if (connection.redisEnabled) {
+    const redisIcon = document.createElement("span");
+    redisIcon.className = "connection-icon redis";
+    redisIcon.textContent = "R";
+    redisIcon.title = "Redis 数据库";
+    badges.appendChild(redisIcon);
+  }
+
+  const name = document.createElement("span");
+  name.className = "connection-name";
+  name.textContent = `${connection.name}${connection.readonly ? " (只读)" : ""}`;
+
+  const activeDot = document.createElement("span");
+  activeDot.className = "connection-active-dot";
+  activeDot.title = "数据库连接活跃";
+  activeDot.hidden = !connection.sqlConnected && !connection.redisConnected;
+
+  main.append(badges, name, activeDot);
+  main.addEventListener("click", (event) => {
+    event.preventDefault();
+    handleConnectionClick(connection.id);
+  });
+
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.className = "connection-edit";
+  edit.textContent = "编辑";
+  edit.addEventListener("click", (event) => {
+    event.preventDefault();
+    editConnection(connection.id);
+  });
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "connection-remove";
+  remove.textContent = "删除";
+  remove.addEventListener("click", (event) => {
+    event.preventDefault();
+    openDeleteConnectionModal(connection.id);
+  });
+
+  summary.append(main, edit, remove);
+  item.append(summary);
+  item.appendChild(renderConnectionTables(connection));
+  return item;
+}
+
+function setupGroupDropTarget(groupEl, groupId) {
+  groupEl.addEventListener("dragover", (event) => {
+    if (!state.dragConnectionId) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    groupEl.classList.add("drop-target");
+  });
+  groupEl.addEventListener("dragleave", (event) => {
+    if (!groupEl.contains(event.relatedTarget)) {
+      groupEl.classList.remove("drop-target");
+    }
+  });
+  groupEl.addEventListener("drop", (event) => {
+    if (!state.dragConnectionId && !(event.dataTransfer && event.dataTransfer.getData("text/plain"))) return;
+    event.preventDefault();
+    groupEl.classList.remove("drop-target");
+    const connectionId = state.dragConnectionId || event.dataTransfer.getData("text/plain");
+    moveConnectionToGroup(connectionId, groupId);
+  });
+}
+
+async function moveConnectionToGroup(connectionId, groupId) {
+  const connection = state.connections.find((item) => item.id === connectionId);
+  if (!connection) return;
+  const targetId = state.groups.some((group) => group.id === groupId) ? groupId : DEFAULT_GROUP_ID;
+  if (connection.groupId === targetId) return;
+
+  connection.groupId = targetId;
+  state.collapsedGroupIds.delete(targetId);
+  saveCollapsedGroups();
+  renderConnections();
+  try {
+    await saveStoredConnections();
+    const groupName = state.groups.find((group) => group.id === targetId)?.name || "分组";
+    setMessage(`已将「${connection.name}」移动到分组「${groupName}」`);
+  } catch (error) {
+    setMessage(`移动连接失败：${error.message}`, true);
+  }
+}
+
+function openGroupModal(group = null) {
+  state.editingGroupId = group?.id || null;
+  els.groupModalTitle.textContent = group ? "重命名分组" : "新建分组";
+  els.groupForm.reset();
+  els.groupName.value = group?.name || "";
+  els.groupModal.classList.remove("hidden");
+  els.groupName.focus();
+  els.groupName.select();
+}
+
+function closeGroupModal() {
+  state.editingGroupId = null;
+  els.groupModal.classList.add("hidden");
+}
+
+async function saveGroup(event) {
+  if (event) event.preventDefault();
+  const name = els.groupName.value.trim();
+  if (!name) {
+    setMessage("分组名称不能为空", true);
+    return;
+  }
+
+  const editingId = state.editingGroupId;
+  if (editingId) {
+    const group = state.groups.find((item) => item.id === editingId);
+    if (group) group.name = name;
+  } else {
+    state.groups.push({ id: newGroupId(), name });
+  }
+
+  try {
+    await saveStoredConnections();
+    closeGroupModal();
+    renderConnections();
+    setMessage(editingId ? "分组已重命名" : "分组已创建");
+  } catch (error) {
+    setMessage(`保存分组失败：${error.message}`, true);
+  }
+}
+
+function openDeleteGroupModal(group) {
+  if (!group || group.id === DEFAULT_GROUP_ID) return;
+  state.deletingGroupId = group.id;
+  const defaultName = state.groups.find((item) => item.id === DEFAULT_GROUP_ID)?.name || DEFAULT_GROUP_NAME;
+  const count = state.connections.filter((connection) => connection.groupId === group.id).length;
+  els.deleteGroupText.textContent = count > 0
+    ? `确定删除分组「${group.name}」吗？组内 ${count} 个连接会移动到「${defaultName}」，连接本身不会被删除。`
+    : `确定删除分组「${group.name}」吗？`;
+  els.deleteGroupModal.classList.remove("hidden");
+  els.confirmDeleteGroupButton.focus();
+}
+
+function closeDeleteGroupModal() {
+  state.deletingGroupId = null;
+  els.deleteGroupModal.classList.add("hidden");
+}
+
+async function confirmDeleteGroup() {
+  const id = state.deletingGroupId;
+  if (!id || id === DEFAULT_GROUP_ID) {
+    closeDeleteGroupModal();
+    return;
+  }
+  closeDeleteGroupModal();
+
+  state.connections.forEach((connection) => {
+    if (connection.groupId === id) connection.groupId = DEFAULT_GROUP_ID;
+  });
+  state.groups = state.groups.filter((group) => group.id !== id);
+  state.collapsedGroupIds.delete(id);
+  saveCollapsedGroups();
+  renderConnections();
+  try {
+    await saveStoredConnections();
+    setMessage("分组已删除，组内连接已移动到默认分组");
+  } catch (error) {
+    setMessage(`删除分组失败：${error.message}`, true);
+  }
 }
 
 function connectionIconClass(connection) {
@@ -2222,6 +2551,20 @@ function renderConnectionTables(connection) {
   return wrapper;
 }
 
+function populateConnectionGroupOptions(selectedGroupId) {
+  const groups = state.groups.length ? state.groups : ensureDefaultGroup([]);
+  const groupIds = new Set(groups.map((group) => group.id));
+  const value = groupIds.has(selectedGroupId) ? selectedGroupId : DEFAULT_GROUP_ID;
+  els.connectionGroup.innerHTML = "";
+  groups.forEach((group) => {
+    const option = document.createElement("option");
+    option.value = group.id;
+    option.textContent = group.name;
+    els.connectionGroup.appendChild(option);
+  });
+  els.connectionGroup.value = value;
+}
+
 function openConnectionModal(connection = null) {
   state.editingConnectionId = connection?.id || null;
   els.connectionModalTitle.textContent = connection ? "编辑连接" : "新建连接";
@@ -2232,6 +2575,7 @@ function openConnectionModal(connection = null) {
   els.readOnlyRow.classList.remove("hidden");
   els.redisEnabledRow.classList.remove("hidden");
   setConnectionMode("dsn");
+  populateConnectionGroupOptions(connection?.groupId || DEFAULT_GROUP_ID);
 
   if (connection) {
     els.connectionName.value = connection.name;
@@ -2316,6 +2660,55 @@ function rememberActiveTabQuery(activeQuery = state.activeQuery) {
   const tab = activeTableTab();
   if (!tab) return;
   tab.activeQuery = activeQuery ? { ...activeQuery } : null;
+}
+
+function saveActiveTabView() {
+  const tab = activeTableTab();
+  if (!tab) return;
+  tab.view = {
+    rows: state.activeRows,
+    rowsTotal: state.activeRowsTotal,
+    rowsHasMore: state.activeRowsHasMore,
+    realRowsLoaded: state.activeRealRowsLoaded,
+    columns: state.gridColumns,
+    editable: state.gridEditable,
+    virtual: state.gridVirtual,
+    queryMode: state.queryMode,
+    activeQuery: state.activeQuery ? { ...state.activeQuery } : null,
+    scrollTop: els.tableWrap.scrollTop,
+    scrollLeft: els.tableWrap.scrollLeft,
+    title: els.viewTitle.textContent,
+    meta: els.viewMeta.textContent,
+    message: els.message.textContent,
+    messageIsError: els.message.classList.contains("error"),
+  };
+}
+
+function restoreTabView(tab) {
+  if (!tab?.view) return false;
+  const view = tab.view;
+  state.activeRows = view.rows || [];
+  state.activeRowsTotal = view.rowsTotal ?? null;
+  state.activeRowsHasMore = Boolean(view.rowsHasMore);
+  state.activeRealRowsLoaded = Number.isFinite(view.realRowsLoaded) ? view.realRowsLoaded : state.activeRows.length;
+  state.queryMode = Boolean(view.queryMode);
+  state.activeQuery = view.activeQuery ? { ...view.activeQuery } : null;
+  els.viewTitle.textContent = view.title || (state.activeQuery ? `浏览数据 ${tab.table.name}` : `浏览数据 ${tab.table.name}`);
+  els.viewMeta.textContent = view.meta || `${tab.hostLabel}，每次加载 ${TABLE_ROW_LIMIT} 行${tab.connection.readonly ? "，只读连接" : ""}`;
+  els.tableWrap.scrollTop = Number.isFinite(view.scrollTop) ? view.scrollTop : 0;
+  els.tableWrap.scrollLeft = Number.isFinite(view.scrollLeft) ? view.scrollLeft : 0;
+  renderGrid(view.columns || tab.table.columns.map((column) => column.name), state.activeRows, Boolean(view.editable), { virtual: view.virtual !== false });
+  els.tableWrap.scrollTop = Number.isFinite(view.scrollTop) ? view.scrollTop : 0;
+  els.tableWrap.scrollLeft = Number.isFinite(view.scrollLeft) ? view.scrollLeft : 0;
+  if (state.gridVirtual) {
+    renderVisibleRows({ force: true });
+  }
+  if (view.message) {
+    setMessage(view.message, Boolean(view.messageIsError));
+  } else {
+    setMessage(rowLoadMessage());
+  }
+  return true;
 }
 
 function activeTableSort() {
@@ -2413,6 +2806,7 @@ async function switchTab(id) {
   hideSqlAutocomplete();
   rememberActiveTabSql();
   rememberActiveTabQuery();
+  saveActiveTabView();
   state.activeTabId = id;
   state.activeConnectionId = tab.connectionId;
   state.activeTable = tab.table;
@@ -2422,6 +2816,9 @@ async function switchTab(id) {
   renderTabs();
   renderConnections();
   els.sqlEditor.value = tab.sql || defaultSqlForTable(tab.table);
+  if (restoreTabView(tab)) {
+    return;
+  }
   if (state.activeQuery) {
     await loadQueryRows({
       append: false,
@@ -2471,6 +2868,8 @@ async function addConnection(event) {
   const redisEnabled = kind === "redis" || els.redisEnabled.checked;
   const redisUrl = redisEnabled ? (els.redisUrl.value.trim() || DEFAULT_REDIS_URL) : "";
   const readonly = kind === "redis" ? true : els.readOnlyConnection.checked;
+  const selectedGroupId = els.connectionGroup.value || DEFAULT_GROUP_ID;
+  const groupId = state.groups.some((group) => group.id === selectedGroupId) ? selectedGroupId : DEFAULT_GROUP_ID;
 
   if (!name || (kind !== "redis" && !sqlUrl) || (kind === "redis" && !redisUrl)) {
     setMessage("连接名称和数据库连接信息不能为空", true);
@@ -2494,6 +2893,7 @@ async function addConnection(event) {
     existing.tables = [];
     existing.loadingTables = false;
     existing.readonly = readonly;
+    existing.groupId = groupId;
     state.expandedConnectionIds.delete(existing.id);
     state.tabs.forEach((tab) => {
       if (tab.connectionId === oldActiveId) {
@@ -2512,6 +2912,7 @@ async function addConnection(event) {
       redisUrl,
       redisEnabled,
       readonly,
+      groupId,
     });
   }
 
@@ -2958,6 +3359,7 @@ async function loadRows({ append = false } = {}) {
     }
     syncTableLoadedCount(state.activeTable, state.activeRealRowsLoaded);
     setMessage(rowLoadMessage());
+    saveActiveTabView();
   } catch (error) {
     setMessage(error.message, true);
   } finally {
@@ -3122,6 +3524,7 @@ async function loadQueryRows({
       els.viewMeta.textContent = `查询结果只读，每次加载 ${data.limit || queryLimit} 行`;
     }
     setMessage(rowLoadMessage());
+    saveActiveTabView();
   } catch (error) {
     setMessage(error.message, true);
   } finally {
@@ -3906,6 +4309,300 @@ async function writeClipboardText(text) {
   }
 }
 
+function setupTimestampTool() {
+  if (!els.timestampInput) return;
+  els.timestampInput.value = String(Math.floor(Date.now() / 1000));
+  els.datetimeInput.value = formatLocalDateTime(new Date());
+  renderTimestampConversion();
+  renderDatetimeConversion();
+  updateCurrentTimestamp();
+  window.setInterval(updateCurrentTimestamp, 1000);
+  els.timestampInput.addEventListener("input", renderTimestampConversion);
+  els.datetimeInput.addEventListener("input", renderDatetimeConversion);
+  els.timestampNowButton.addEventListener("click", () => {
+    els.timestampInput.value = String(Date.now());
+    renderTimestampConversion();
+    els.timestampInput.focus();
+    els.timestampInput.select();
+  });
+  els.datetimeNowButton.addEventListener("click", () => {
+    els.datetimeInput.value = formatLocalDateTime(new Date());
+    renderDatetimeConversion();
+    els.datetimeInput.focus();
+    els.datetimeInput.select();
+  });
+  els.copyCurrentTimestampButton.addEventListener("click", () => copyTimestampText(els.currentTimestampSeconds.textContent, "当前秒时间戳"));
+  document.querySelectorAll("[data-copy-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = document.getElementById(button.dataset.copyTarget);
+      copyTimestampText(target?.textContent || "", button.title.replace(/^复制/, ""));
+    });
+  });
+}
+
+function setupToolTabs() {
+  setToolsPanelCollapsed(localStorage.getItem(TOOLS_PANEL_COLLAPSED_KEY) !== "0");
+  els.toolsToggleButton.addEventListener("click", () => {
+    setToolsPanelCollapsed(!els.toolsPanel.classList.contains("collapsed"));
+  });
+  els.toolTabs.forEach((tab) => {
+    tab.addEventListener("click", () => activateToolTab(tab));
+  });
+}
+
+function activateToolTab(activeTab) {
+  const paneId = activeTab.getAttribute("aria-controls");
+  els.toolTabs.forEach((tab) => {
+    const isActive = tab === activeTab;
+    tab.classList.toggle("active", isActive);
+    tab.setAttribute("aria-selected", String(isActive));
+  });
+  els.toolPanes.forEach((pane) => {
+    pane.classList.toggle("active", pane.id === paneId);
+  });
+}
+
+function setupJsonTool() {
+  if (!els.jsonInput) return;
+  els.jsonFormatButton.addEventListener("click", formatJsonInput);
+  els.jsonEscapeButton.addEventListener("click", escapeJsonInput);
+  els.jsonUnescapeButton.addEventListener("click", unescapeJsonInput);
+  els.jsonCopyButton.addEventListener("click", copyJsonOutput);
+}
+
+function formatJsonInput() {
+  const rawText = els.jsonInput.value.trim();
+  if (!rawText) {
+    setJsonToolResult("", "请输入需要美化的 JSON", true);
+    return;
+  }
+  try {
+    const parsed = JSON.parse(rawText);
+    setJsonToolResult(JSON.stringify(parsed, null, 2), "JSON 格式有效");
+  } catch (error) {
+    setJsonToolResult("", `JSON 解析失败：${error.message}`, true);
+  }
+}
+
+function escapeJsonInput() {
+  const rawText = els.jsonInput.value;
+  if (!rawText) {
+    setJsonToolResult("", "请输入需要转义的内容", true);
+    return;
+  }
+  setJsonToolResult(JSON.stringify(rawText), "已生成 JSON 字符串转义结果");
+}
+
+function unescapeJsonInput() {
+  const rawText = els.jsonInput.value.trim();
+  if (!rawText) {
+    setJsonToolResult("", "请输入需要反转义的 JSON 字符串", true);
+    return;
+  }
+  try {
+    const parsed = JSON.parse(rawText);
+    if (typeof parsed !== "string") {
+      setJsonToolResult("", "反转义输入必须是 JSON 字符串，例如 \"{\\\"a\\\":1}\"", true);
+      return;
+    }
+    setJsonToolResult(parsed, "已反转义 JSON 字符串");
+  } catch (error) {
+    setJsonToolResult("", `JSON 字符串解析失败：${error.message}`, true);
+  }
+}
+
+async function copyJsonOutput() {
+  const text = els.jsonOutput.textContent.trim();
+  if (!text || text === "请输入 JSON 后点击“美化展示”") {
+    setJsonToolResult("", "没有可复制的 JSON 结果", true);
+    return;
+  }
+  try {
+    await writeClipboardText(text);
+    setJsonStatus("已复制结果");
+  } catch (error) {
+    setJsonStatus(`复制失败：${error.message}`, true);
+  }
+}
+
+function setJsonToolResult(text, status, isError = false) {
+  els.jsonOutput.textContent = text || status;
+  els.jsonOutput.classList.toggle("error", Boolean(isError));
+  setJsonStatus(status, isError);
+}
+
+function setJsonStatus(status, isError = false) {
+  els.jsonStatus.textContent = status;
+  els.jsonStatus.classList.toggle("error", Boolean(isError));
+}
+
+function setToolsPanelCollapsed(collapsed) {
+  els.toolsPanel.classList.toggle("collapsed", collapsed);
+  els.toolsContent.classList.toggle("hidden", collapsed);
+  els.toolsToggleButton.textContent = collapsed ? "展开" : "收起";
+  els.toolsToggleButton.setAttribute("aria-expanded", String(!collapsed));
+  localStorage.setItem(TOOLS_PANEL_COLLAPSED_KEY, collapsed ? "1" : "0");
+}
+
+function updateCurrentTimestamp() {
+  if (!els.currentTimestampSeconds) return;
+  els.currentTimestampSeconds.textContent = String(Math.floor(Date.now() / 1000));
+}
+
+function renderTimestampConversion() {
+  const result = parseTimestampInput(els.timestampInput.value);
+  if (!result.ok) {
+    setTimestampError(result.message);
+    setTimestampOutputs(null);
+    return;
+  }
+  setTimestampError("");
+  setTimestampOutputs(result.date);
+}
+
+function renderDatetimeConversion() {
+  const result = parseDatetimeInput(els.datetimeInput.value);
+  if (!result.ok) {
+    setDatetimeError(result.message);
+    setDatetimeOutputs(null);
+    return;
+  }
+  setDatetimeError("");
+  setDatetimeOutputs(result.date);
+}
+
+function parseTimestampInput(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return { ok: false, message: "请输入秒级或毫秒级 Unix 时间戳" };
+  }
+  if (!/^-?\d+(?:\.\d+)?$/.test(normalized)) {
+    return { ok: false, message: "时间戳只能包含数字，可带小数秒" };
+  }
+  const numericValue = Number(normalized);
+  if (!Number.isFinite(numericValue)) {
+    return { ok: false, message: "时间戳超出可识别范围" };
+  }
+  const milliseconds = Math.abs(numericValue) >= 100000000000 ? numericValue : numericValue * 1000;
+  const date = new Date(milliseconds);
+  if (Number.isNaN(date.getTime())) {
+    return { ok: false, message: "无法转换为有效日期" };
+  }
+  return { ok: true, date };
+}
+
+function parseDatetimeInput(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return { ok: false, message: "请输入时间，例如 2026-07-09 00:00:00" };
+  }
+  const date = new Date(normalizeDatetimeText(normalized));
+  if (Number.isNaN(date.getTime())) {
+    return { ok: false, message: "无法识别该时间，请使用 YYYY-MM-DD HH:mm:ss 或 ISO8601 格式" };
+  }
+  return { ok: true, date };
+}
+
+function normalizeDatetimeText(value) {
+  if (/^\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{1,2}(?::\d{1,2}(?:\.\d{1,3})?)?$/.test(value)) {
+    return value.replace(/\s+/, "T");
+  }
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(value)) {
+    return `${value}T00:00:00`;
+  }
+  return value;
+}
+
+function setTimestampError(message) {
+  els.timestampError.textContent = message;
+  els.timestampError.classList.toggle("hidden", !message);
+}
+
+function setDatetimeError(message) {
+  els.datetimeError.textContent = message;
+  els.datetimeError.classList.toggle("hidden", !message);
+}
+
+function setTimestampOutputs(date) {
+  const outputs = [
+    els.timestampSecondsOutput,
+    els.timestampMillisecondsOutput,
+    els.timestampLocalOutput,
+    els.timestampTimezoneOutput,
+    els.timestampIsoOutput,
+    els.timestampUtcOutput,
+  ];
+  if (!date) {
+    outputs.forEach((output) => {
+      output.textContent = "-";
+      output.title = "";
+    });
+    return;
+  }
+  const values = [
+    String(Math.floor(date.getTime() / 1000)),
+    String(date.getTime()),
+    formatLocalDateTime(date),
+    Intl.DateTimeFormat().resolvedOptions().timeZone || "本地时区",
+    date.toISOString(),
+    formatUtcDateTime(date),
+  ];
+  outputs.forEach((output, index) => {
+    output.textContent = values[index];
+    output.title = values[index];
+  });
+}
+
+function setDatetimeOutputs(date) {
+  const outputs = [els.datetimeSecondsOutput, els.datetimeMillisecondsOutput];
+  if (!date) {
+    outputs.forEach((output) => {
+      output.textContent = "-";
+      output.title = "";
+    });
+    return;
+  }
+  const values = [String(Math.floor(date.getTime() / 1000)), String(date.getTime())];
+  outputs.forEach((output, index) => {
+    output.textContent = values[index];
+    output.title = values[index];
+  });
+}
+
+function formatLocalDateTime(date) {
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+  ].join("-") + ` ${padDatePart(date.getHours())}:${padDatePart(date.getMinutes())}:${padDatePart(date.getSeconds())}`;
+}
+
+function formatUtcDateTime(date) {
+  return [
+    date.getUTCFullYear(),
+    padDatePart(date.getUTCMonth() + 1),
+    padDatePart(date.getUTCDate()),
+  ].join("-") + ` ${padDatePart(date.getUTCHours())}:${padDatePart(date.getUTCMinutes())}:${padDatePart(date.getUTCSeconds())}`;
+}
+
+function padDatePart(value) {
+  return String(value).padStart(2, "0");
+}
+
+async function copyTimestampText(text, label = "内容") {
+  const normalized = String(text || "").trim();
+  if (!normalized || normalized === "-") {
+    setMessage("没有可复制的时间戳转换结果", true);
+    return;
+  }
+  try {
+    await writeClipboardText(normalized);
+    setMessage(`已复制${label}`);
+  } catch (error) {
+    setMessage(`复制失败：${error.message}`, true);
+  }
+}
+
 function tableText(matrix) {
   return [matrix.columns, ...matrix.rows].map((row) => row.map(tsvCell).join("\t")).join("\n");
 }
@@ -4345,6 +5042,23 @@ window.addEventListener("resize", hideCellTooltip);
 document.addEventListener("pointerdown", handleDocumentPointerDown);
 document.addEventListener("keydown", handleDocumentCopyShortcut);
 els.newConnectionButton.addEventListener("click", () => openConnectionModal());
+els.newGroupButton.addEventListener("click", () => openGroupModal());
+els.closeGroupModal.addEventListener("click", closeGroupModal);
+els.cancelGroupButton.addEventListener("click", closeGroupModal);
+els.groupForm.addEventListener("submit", saveGroup);
+els.closeDeleteGroupModal.addEventListener("click", closeDeleteGroupModal);
+els.cancelDeleteGroupButton.addEventListener("click", closeDeleteGroupModal);
+els.confirmDeleteGroupButton.addEventListener("click", confirmDeleteGroup);
+els.groupModal.addEventListener("click", (event) => {
+  if (event.target === els.groupModal) {
+    closeGroupModal();
+  }
+});
+els.deleteGroupModal.addEventListener("click", (event) => {
+  if (event.target === els.deleteGroupModal) {
+    closeDeleteGroupModal();
+  }
+});
 els.closeConnectionModal.addEventListener("click", closeConnectionModal);
 els.cancelConnectionButton.addEventListener("click", closeConnectionModal);
 els.closeDeleteModal.addEventListener("click", closeDeleteConnectionModal);
@@ -4395,6 +5109,9 @@ async function start() {
     setupSidebarResize();
     setupAiPanelResize();
     setupSqlAutocomplete();
+    setupToolTabs();
+    setupTimestampTool();
+    setupJsonTool();
     state.connections = await loadStoredConnections();
     await loadAiSessionLinks();
     els.redisUrl.value = DEFAULT_REDIS_URL;

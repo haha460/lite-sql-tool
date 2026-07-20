@@ -28,7 +28,10 @@
       <div class="sidebar-section">
         <div class="section-header">
           <div class="section-title">连接</div>
-          <button id="newConnectionButton" type="button">新建连接</button>
+          <div class="section-actions">
+            <button id="newGroupButton" type="button">新建分组</button>
+            <button id="newConnectionButton" type="button">新建连接</button>
+          </div>
         </div>
         <div id="connectionList" class="connection-list"></div>
       </div>
@@ -53,6 +56,132 @@
       </header>
 
       <nav id="tabBar" class="tab-bar"></nav>
+
+      <section class="tools-panel collapsed" aria-labelledby="toolsPanelTitle">
+        <div class="tools-toolbar">
+          <div>
+            <h3 id="toolsPanelTitle">工具栏</h3>
+            <p>常用辅助工具，可继续扩展更多子 Tab</p>
+          </div>
+          <div class="tools-toolbar-actions">
+            <div class="tool-tabs" role="tablist" aria-label="工具列表">
+              <button id="timestampToolTab" class="tool-tab active" type="button" role="tab" aria-selected="true" aria-controls="timestampToolPane">时间戳转换</button>
+              <button id="jsonToolTab" class="tool-tab" type="button" role="tab" aria-selected="false" aria-controls="jsonToolPane">JSON 可视化</button>
+            </div>
+            <button id="toolsToggleButton" class="tools-toggle-button" type="button" aria-expanded="false" aria-controls="toolsContent">展开</button>
+          </div>
+        </div>
+
+        <div id="toolsContent" class="tools-content hidden">
+        <section id="timestampToolPane" class="timestamp-tool tool-pane active" role="tabpanel" aria-labelledby="timestampToolTab">
+          <div class="timestamp-tool-header">
+            <div>
+              <h3 id="timestampToolTitle">时间戳转换</h3>
+              <p>Unix 秒 / 毫秒时间戳与本地时间互转</p>
+            </div>
+            <div class="timestamp-header-actions">
+              <div class="timestamp-now-card" title="每秒刷新当前时间戳">
+                <span>当前秒</span>
+                <strong id="currentTimestampSeconds">-</strong>
+                <button id="copyCurrentTimestampButton" class="timestamp-icon-button" type="button" title="复制当前秒时间戳" aria-label="复制当前秒时间戳">⧉</button>
+              </div>
+            </div>
+          </div>
+          <div id="timestampToolBody" class="timestamp-tool-body">
+            <div class="timestamp-converter-card">
+              <div class="timestamp-card-title">时间戳转日期</div>
+              <div class="timestamp-input-row">
+                <label for="timestampInput">输入时间戳</label>
+                <input id="timestampInput" type="text" inputmode="numeric" spellcheck="false" placeholder="例如 1783526400 或 1783526400000">
+                <button id="timestampNowButton" type="button">使用当前</button>
+              </div>
+              <div id="timestampError" class="timestamp-error hidden"></div>
+              <div class="timestamp-result-grid">
+                <div class="timestamp-result-item">
+                  <span>Timestamp</span>
+                  <output id="timestampSecondsOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="timestampSecondsOutput" title="复制秒时间戳" aria-label="复制秒时间戳">⧉</button>
+                </div>
+                <div class="timestamp-result-item">
+                  <span>毫秒级时间戳</span>
+                  <output id="timestampMillisecondsOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="timestampMillisecondsOutput" title="复制毫秒时间戳" aria-label="复制毫秒时间戳">⧉</button>
+                </div>
+                <div class="timestamp-result-item">
+                  <span>本地时间</span>
+                  <output id="timestampLocalOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="timestampLocalOutput" title="复制本地时间" aria-label="复制本地时间">⧉</button>
+                </div>
+                <div class="timestamp-result-item">
+                  <span>您的时区</span>
+                  <output id="timestampTimezoneOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="timestampTimezoneOutput" title="复制时区" aria-label="复制时区">⧉</button>
+                </div>
+                <div class="timestamp-result-item">
+                  <span>ISO8601</span>
+                  <output id="timestampIsoOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="timestampIsoOutput" title="复制 ISO8601" aria-label="复制 ISO8601">⧉</button>
+                </div>
+                <div class="timestamp-result-item">
+                  <span>UTC</span>
+                  <output id="timestampUtcOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="timestampUtcOutput" title="复制 UTC" aria-label="复制 UTC">⧉</button>
+                </div>
+              </div>
+            </div>
+            <div class="timestamp-converter-card">
+              <div class="timestamp-card-title">日期转时间戳</div>
+              <div class="timestamp-input-row">
+                <label for="datetimeInput">输入时间</label>
+                <input id="datetimeInput" type="text" spellcheck="false" placeholder="例如 2026-07-09 00:00:00">
+                <button id="datetimeNowButton" type="button">使用当前</button>
+              </div>
+              <div id="datetimeError" class="timestamp-error hidden"></div>
+              <div class="timestamp-result-grid compact">
+                <div class="timestamp-result-item">
+                  <span>Timestamp</span>
+                  <output id="datetimeSecondsOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="datetimeSecondsOutput" title="复制秒时间戳" aria-label="复制秒时间戳">⧉</button>
+                </div>
+                <div class="timestamp-result-item">
+                  <span>毫秒级时间戳</span>
+                  <output id="datetimeMillisecondsOutput">-</output>
+                  <button class="timestamp-icon-button" type="button" data-copy-target="datetimeMillisecondsOutput" title="复制毫秒时间戳" aria-label="复制毫秒时间戳">⧉</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="jsonToolPane" class="json-tool tool-pane" role="tabpanel" aria-labelledby="jsonToolTab">
+          <div class="json-tool-header">
+            <div>
+              <h3>JSON 可视化</h3>
+              <p>格式化展示 JSON，并支持 JSON 字符串转义 / 反转义</p>
+            </div>
+            <div class="json-tool-actions">
+              <button id="jsonFormatButton" type="button">美化展示</button>
+              <button id="jsonEscapeButton" type="button">JSON 转义</button>
+              <button id="jsonUnescapeButton" type="button">反转义</button>
+              <button id="jsonCopyButton" type="button">复制结果</button>
+            </div>
+          </div>
+          <div class="json-tool-grid">
+            <label class="json-editor-card">
+              <span>输入 JSON / 字符串</span>
+              <textarea id="jsonInput" spellcheck="false" placeholder='例如 {"name":"Codex","ok":true}'></textarea>
+            </label>
+            <div class="json-editor-card">
+              <div class="json-output-header">
+                <span>结果</span>
+                <span id="jsonStatus" class="json-status">等待输入</span>
+              </div>
+              <pre id="jsonOutput" class="json-output">请输入 JSON 后点击“美化展示”</pre>
+            </div>
+          </div>
+        </section>
+        </div>
+      </section>
 
       <section class="query-panel">
         <div class="sql-editor-wrap">
@@ -125,6 +254,8 @@
         </div>
         <form id="connectionForm" class="connection-form">
           <input id="connectionName" type="text" placeholder="连接名称" autocomplete="off">
+          <label class="field-label" for="connectionGroup">所属分组</label>
+          <select id="connectionGroup" title="所属分组"></select>
           <select id="driverSelect" title="数据库类型">
             <option value="mysql" selected>MySQL</option>
             <option value="postgresql">PostgreSQL / PG</option>
@@ -178,6 +309,36 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=sql-autocomplete-20260629-1"></script>
+    <div id="groupModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="groupModalTitle">
+      <div class="modal-panel confirm-panel">
+        <div class="modal-header">
+          <h3 id="groupModalTitle">新建分组</h3>
+          <button id="closeGroupModal" type="button" title="关闭">关闭</button>
+        </div>
+        <form id="groupForm" class="connection-form">
+          <input id="groupName" type="text" placeholder="分组名称" autocomplete="off" maxlength="40">
+          <div class="modal-actions">
+            <button id="cancelGroupButton" type="button">取消</button>
+            <button type="submit">保存分组</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="deleteGroupModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="deleteGroupTitle">
+      <div class="modal-panel confirm-panel">
+        <div class="modal-header">
+          <h3 id="deleteGroupTitle">删除分组</h3>
+          <button id="closeDeleteGroupModal" type="button" title="关闭">关闭</button>
+        </div>
+        <p id="deleteGroupText" class="confirm-text"></p>
+        <div class="modal-actions">
+          <button id="cancelDeleteGroupButton" type="button">取消</button>
+          <button id="confirmDeleteGroupButton" class="danger-button" type="button">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/app.js?v=connection-groups-20260720-2"></script>
   </body>
 </html>

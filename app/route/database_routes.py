@@ -27,7 +27,10 @@ def health() -> dict[str, Any]:
 
 @router.get("/api/connections")
 def get_saved_connections() -> dict[str, Any]:
-    return {"connections": connection_api.load_saved_connections()}
+    return {
+        "connections": connection_api.load_saved_connections(),
+        "groups": connection_api.load_saved_groups(),
+    }
 
 
 @router.put("/api/connections")

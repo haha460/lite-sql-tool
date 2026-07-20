@@ -6,12 +6,19 @@ from pydantic import BaseModel, Field
 
 
 DEFAULT_QUERY_LIMIT = 100
+DEFAULT_GROUP_ID = "default"
+DEFAULT_GROUP_NAME = "默认分组"
 
 
 class ConnectionInfo(BaseModel):
     sql_url: str | None = None
     redis_url: str | None = None
     readonly: bool = False
+
+
+class ConnectionGroup(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
 
 
 class SavedConnection(BaseModel):
@@ -22,10 +29,12 @@ class SavedConnection(BaseModel):
     redisUrl: str = ""
     redisEnabled: bool = False
     readonly: bool = False
+    groupId: str = DEFAULT_GROUP_ID
 
 
 class SavedConnectionsRequest(BaseModel):
     connections: list[SavedConnection] = Field(default_factory=list)
+    groups: list[ConnectionGroup] = Field(default_factory=list)
 
 
 class SqlQueryRequest(BaseModel):
