@@ -42,6 +42,12 @@ class AiToolSelectRequest(BaseModel):
     limit: int = Field(default=DEFAULT_AI_LIMIT, ge=1, le=MAX_AI_LIMIT)
 
 
+class AiToolKnowledgeRequest(BaseModel):
+    session_id: str
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
 class AiSkillUploadRequest(BaseModel):
     session_id: str
     filename: str = Field(min_length=1)

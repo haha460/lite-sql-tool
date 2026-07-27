@@ -11,12 +11,13 @@ from app.dto.ai import (
     AiSessionLookupRequest,
     AiSessionRequest,
     AiSkillUploadRequest,
+    AiToolKnowledgeRequest,
     AiToolSchemaRequest,
     AiToolSelectRequest,
 )
 from app.api.ai_api import ai_api, ai_database_api, ai_session_api
 from app.model.ai_session import AiSession
-from app.service import ai_skill_service
+from app.service import ai_skill_service, knowledge_service
 
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
@@ -208,6 +209,47 @@ def ai_tool_select(payload: AiToolSelectRequest) -> dict[str, Any]:
             "sql_index": sql_index,
             "row_count": len(result.get("rows") or []),
             "truncated": bool(result.get("truncated")),
+        },
+    )
+    return result
+
+
+@router.post("/tool/knowledge_search")
+async def ai_tool_knowledge_search(payload: AiToolKnowledgeRequest) -> dict[str, Any]:
+    session = ai_session_api.require_session(payload.session_id)
+    ai_api.publish_stream_event(
+        session.id,
+        {
+            "type": "step",
+            "phase": "knowledge",
+            "title": "检索知识库",
+            "status": "running",
+            "detail": f"正在检索:{payload.query}",
+        },
+    )
+    try:
+        result = await knowledge_service.search_knowledge(payload.query, payload.top_k)
+    except Exception as exc:
+        ai_api.publish_stream_event(
+            session.id,
+            {
+                "type": "step",
+                "phase": "knowledge",
+                "title": "检索知识库",
+                "status": "error",
+                "detail": "知识库检索失败",
+                "error": str(getattr(exc, "detail", exc)),
+            },
+        )
+        raise
+    ai_api.publish_stream_event(
+        session.id,
+        {
+            "type": "step",
+            "phase": "knowledge",
+            "title": "检索知识库",
+            "status": "done",
+            "detail": f"命中 {result.get('count', 0)} 个相关片段",
         },
     )
     return result

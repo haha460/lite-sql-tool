@@ -14,7 +14,7 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 LOG_BACKUP_DAYS="${LOG_BACKUP_DAYS:-14}"
 REQ_STAMP="$VENV_DIR/.requirements.sha256"
 
-LOG_DIR="$ROOT_DIR/log"
+LOG_DIR="$ROOT_DIR/log/app"
 PID_FILE="$LOG_DIR/app.pid"
 PORT_FILE="$LOG_DIR/app.port"
 LOG_FILE="$LOG_DIR/app.log"

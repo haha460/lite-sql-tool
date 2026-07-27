@@ -67,6 +67,7 @@
             <div class="tool-tabs" role="tablist" aria-label="工具列表">
               <button id="timestampToolTab" class="tool-tab active" type="button" role="tab" aria-selected="true" aria-controls="timestampToolPane">时间戳转换</button>
               <button id="jsonToolTab" class="tool-tab" type="button" role="tab" aria-selected="false" aria-controls="jsonToolPane">JSON 可视化</button>
+              <button id="uuidToolTab" class="tool-tab" type="button" role="tab" aria-selected="false" aria-controls="uuidToolPane">UUID 生成</button>
             </div>
             <button id="toolsToggleButton" class="tools-toggle-button" type="button" aria-expanded="false" aria-controls="toolsContent">展开</button>
           </div>
@@ -180,6 +181,33 @@
             </div>
           </div>
         </section>
+        <section id="uuidToolPane" class="uuid-tool tool-pane" role="tabpanel" aria-labelledby="uuidToolTab">
+          <div class="json-tool-header">
+            <div>
+              <h3>UUID 生成器</h3>
+              <p>生成 v4 随机 UUID，支持批量、大小写和连字符选项</p>
+            </div>
+            <div class="json-tool-actions">
+              <button id="uuidGenerateButton" type="button">生成</button>
+              <button id="uuidCopyButton" type="button">复制结果</button>
+            </div>
+          </div>
+          <div class="uuid-tool-controls">
+            <label class="uuid-field">
+              <span>数量</span>
+              <input id="uuidCount" type="number" min="1" max="100" value="1">
+            </label>
+            <label class="uuid-check"><input id="uuidHyphens" type="checkbox" checked><span>连字符</span></label>
+            <label class="uuid-check"><input id="uuidUppercase" type="checkbox"><span>大写</span></label>
+          </div>
+          <div class="json-editor-card uuid-output-card">
+            <div class="json-output-header">
+              <span>结果</span>
+              <span id="uuidStatus" class="json-status">点击生成</span>
+            </div>
+            <pre id="uuidOutput" class="json-output uuid-output">点击“生成”创建 UUID</pre>
+          </div>
+        </section>
         </div>
       </section>
 
@@ -231,10 +259,17 @@
         </div>
       </div>
       <div id="aiMessageList" class="ai-messages"></div>
-      <div id="aiSqlCard" class="ai-sql-card hidden">
+      <div id="aiSqlCard" class="ai-sql-card collapsed hidden">
         <div class="ai-sql-header">
-          <span>生成的 SQL</span>
-          <button id="aiUseSqlButton" type="button">放入编辑器</button>
+          <button id="aiSqlToggle" type="button" class="ai-sql-toggle" aria-expanded="false" title="展开/收起生成的 SQL">
+            <span class="ai-sql-caret" aria-hidden="true">›</span>
+            <span>生成的 SQL</span>
+            <span id="aiSqlCount" class="ai-sql-count"></span>
+          </button>
+          <div class="ai-sql-header-actions">
+            <button id="aiCopySqlButton" type="button" title="复制全部 SQL">复制</button>
+            <button id="aiUseSqlButton" type="button">放入编辑器</button>
+          </div>
         </div>
         <div id="aiSqlText"></div>
       </div>
@@ -339,6 +374,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=connection-groups-20260720-2"></script>
+    <script src="/static/app.js?v=uuid-tool-20260720-8"></script>
   </body>
 </html>

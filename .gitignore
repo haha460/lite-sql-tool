@@ -22,3 +22,10 @@ ai_sessions.db
 ai_sessions.sqlite
 *.sqlite-journal
 *.db-journal
+
+# Knowledge base build artifact (regenerate with scripts/build_kb.py)
+data/kb.db
+
+# Knowledge base source docs are user data — never commit them (keep dir via .gitkeep)
+knowledge_base/*
+!knowledge_base/.gitkeep

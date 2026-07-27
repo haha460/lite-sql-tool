@@ -53,6 +53,7 @@ const state = {
   aiSkill: null,
   aiLastSql: "",
   aiSqlList: [],
+  aiSqlCollapsed: localStorage.getItem("sqlRedisVisualAiSqlCollapsed") !== "0",
   aiModelId: sessionStorage.getItem("sqlRedisVisualAiModelId") || null,
   aiPanelCollapsed: localStorage.getItem("sqlRedisVisualAiPanelCollapsed") === "1",
   aiRestoreRequestId: 0,
@@ -77,6 +78,7 @@ const TOOLS_PANEL_COLLAPSED_KEY = "sqlRedisVisualToolsPanelCollapsed";
 const DEFAULT_REDIS_URL = "redis://localhost:6379/0";
 const DEFAULT_GROUP_ID = "default";
 const DEFAULT_GROUP_NAME = "默认分组";
+const AI_SQL_COLLAPSED_KEY = "sqlRedisVisualAiSqlCollapsed";
 const TABLE_ROW_LIMIT = 100;
 const QUERY_ROW_LIMIT = 100;
 const VIRTUAL_ROW_HEIGHT = 38;
@@ -253,6 +255,13 @@ const els = {
   jsonEscapeButton: document.querySelector("#jsonEscapeButton"),
   jsonUnescapeButton: document.querySelector("#jsonUnescapeButton"),
   jsonCopyButton: document.querySelector("#jsonCopyButton"),
+  uuidGenerateButton: document.querySelector("#uuidGenerateButton"),
+  uuidCopyButton: document.querySelector("#uuidCopyButton"),
+  uuidCount: document.querySelector("#uuidCount"),
+  uuidHyphens: document.querySelector("#uuidHyphens"),
+  uuidUppercase: document.querySelector("#uuidUppercase"),
+  uuidOutput: document.querySelector("#uuidOutput"),
+  uuidStatus: document.querySelector("#uuidStatus"),
   tabBar: document.querySelector("#tabBar"),
   tableWrap: document.querySelector(".table-wrap"),
   table: document.querySelector("#dataTable"),
@@ -268,6 +277,9 @@ const els = {
   aiMessageList: document.querySelector("#aiMessageList"),
   aiSqlCard: document.querySelector("#aiSqlCard"),
   aiSqlText: document.querySelector("#aiSqlText"),
+  aiSqlToggle: document.querySelector("#aiSqlToggle"),
+  aiSqlCount: document.querySelector("#aiSqlCount"),
+  aiCopySqlButton: document.querySelector("#aiCopySqlButton"),
   aiUseSqlButton: document.querySelector("#aiUseSqlButton"),
   aiForm: document.querySelector("#aiForm"),
   aiPrompt: document.querySelector("#aiPrompt"),
@@ -693,6 +705,7 @@ function appendInlineMarkdown(parent, text) {
     } else if (token.startsWith("`")) {
       const code = document.createElement("code");
       code.textContent = token.slice(1, -1);
+      code.title = code.textContent;
       parent.appendChild(code);
     } else if (token.startsWith("**") || token.startsWith("__")) {
       const strong = document.createElement("strong");
@@ -806,6 +819,7 @@ function renderMarkdownTable(lines, index) {
   headers.forEach((header) => {
     const th = document.createElement("th");
     appendInlineMarkdown(th, header);
+    if (th.textContent) th.title = th.textContent;
     headerRow.appendChild(th);
   });
   thead.appendChild(headerRow);
@@ -817,6 +831,7 @@ function renderMarkdownTable(lines, index) {
     headers.forEach((_, cellIndex) => {
       const td = document.createElement("td");
       appendInlineMarkdown(td, row[cellIndex] || "");
+      if (td.textContent) td.title = td.textContent;
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
@@ -1012,15 +1027,80 @@ function showAiSql(sqlOrList) {
     const sql = sqlTextFromItem(sqlEntry);
     const sqlItem = document.createElement("div");
     sqlItem.className = "ai-sql-item";
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "ai-sql-item-head";
     const title = document.createElement("div");
     title.className = "ai-sql-item-title";
     title.textContent = `SQL ${sqlIndexFromItem(sqlEntry, index)}`;
+    const copyButton = document.createElement("button");
+    copyButton.type = "button";
+    copyButton.className = "ai-sql-copy";
+    copyButton.textContent = "复制";
+    copyButton.title = "复制这条 SQL";
+    copyButton.addEventListener("click", () => copyAiSql(sql, copyButton));
+    titleRow.append(title, copyButton);
+
     const pre = document.createElement("pre");
     pre.textContent = sql;
-    sqlItem.append(title, pre);
+    sqlItem.append(titleRow, pre);
     els.aiSqlText.appendChild(sqlItem);
   });
+  els.aiSqlCount.textContent = sqlList.length > 1 ? `（${sqlList.length} 条）` : "";
   els.aiSqlCard.classList.toggle("hidden", sqlList.length === 0);
+  applyAiSqlCollapsed();
+}
+
+function applyAiSqlCollapsed() {
+  const collapsed = state.aiSqlCollapsed;
+  els.aiSqlCard.classList.toggle("collapsed", collapsed);
+  els.aiSqlToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+function setAiSqlCollapsed(collapsed) {
+  state.aiSqlCollapsed = collapsed;
+  try {
+    localStorage.setItem(AI_SQL_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    // Ignore storage failures (private mode, quota, etc.).
+  }
+  applyAiSqlCollapsed();
+}
+
+function toggleAiSqlCollapsed() {
+  setAiSqlCollapsed(!state.aiSqlCollapsed);
+}
+
+async function copyAiSql(sql, button) {
+  const text = (sql || "").trim();
+  if (!text) return;
+  try {
+    await writeClipboardText(text);
+    if (button) {
+      const original = button.textContent;
+      button.textContent = "已复制";
+      button.classList.add("copied");
+      setTimeout(() => {
+        button.textContent = original;
+        button.classList.remove("copied");
+      }, 1200);
+    }
+    setMessage("SQL 已复制到剪贴板");
+  } catch (error) {
+    setMessage(`复制失败：${error.message}`, true);
+  }
+}
+
+async function copyAllAiSql() {
+  const all = state.aiSqlList
+    .map((item) => sqlTextFromItem(item))
+    .filter(Boolean)
+    .join(";\n\n");
+  if (!all) {
+    setMessage("暂无可复制的 SQL", true);
+    return;
+  }
+  await copyAiSql(all, els.aiCopySqlButton);
 }
 
 function sqlTextFromItem(item) {
@@ -2237,6 +2317,20 @@ function renderConnectionGroup(group, connections) {
   const actions = document.createElement("span");
   actions.className = "group-actions";
 
+  if (connections.length > 0) {
+    const connectAll = document.createElement("button");
+    connectAll.type = "button";
+    connectAll.className = "group-connect";
+    connectAll.textContent = "全部连接";
+    connectAll.title = "连接该分组内所有数据库";
+    connectAll.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      connectGroup(group.id);
+    });
+    actions.appendChild(connectAll);
+  }
+
   const rename = document.createElement("button");
   rename.type = "button";
   rename.className = "group-rename";
@@ -2414,6 +2508,45 @@ async function moveConnectionToGroup(connectionId, groupId) {
     setMessage(`已将「${connection.name}」移动到分组「${groupName}」`);
   } catch (error) {
     setMessage(`移动连接失败：${error.message}`, true);
+  }
+}
+
+async function connectGroup(groupId) {
+  const connections = state.connections.filter(
+    (connection) => (connection.groupId || DEFAULT_GROUP_ID) === groupId,
+  );
+  if (connections.length === 0) {
+    setMessage("该分组没有可连接的数据库", true);
+    return;
+  }
+
+  state.collapsedGroupIds.delete(groupId);
+  saveCollapsedGroups();
+
+  const groupName = state.groups.find((group) => group.id === groupId)?.name || "分组";
+  setMessage(`正在连接分组「${groupName}」内 ${connections.length} 个数据库...`);
+
+  let succeeded = 0;
+  let failed = 0;
+  for (const connection of connections) {
+    try {
+      await useConnection(connection.id);
+    } catch {
+      // useConnection already reports its own errors; keep going.
+    }
+    const connected = isRedisOnly(connection) ? connection.redisConnected : connection.sqlConnected;
+    if (connected) {
+      succeeded += 1;
+    } else {
+      failed += 1;
+    }
+  }
+
+  renderConnections();
+  if (failed === 0) {
+    setMessage(`分组「${groupName}」内 ${succeeded} 个数据库已全部连接`);
+  } else {
+    setMessage(`分组「${groupName}」连接完成：成功 ${succeeded} 个，失败 ${failed} 个`, true);
   }
 }
 
@@ -3840,8 +3973,9 @@ function canEditCell(row, column) {
   if (isReadOnlyActive()) return false;
   if (!state.activeTable) return false;
   if (row.__virtual) {
-    const columnMeta = state.activeTable.columns.find((item) => item.name === column);
-    return !columnMeta?.primary_key;
+    // A brand-new row needs every column editable, including the primary key
+    // (e.g. app-generated string ids that have no auto-increment default).
+    return true;
   }
   return canEditColumn(column);
 }
@@ -4370,6 +4504,56 @@ function setupJsonTool() {
   els.jsonCopyButton.addEventListener("click", copyJsonOutput);
 }
 
+function setupUuidTool() {
+  if (!els.uuidGenerateButton) return;
+  els.uuidGenerateButton.addEventListener("click", generateUuids);
+  els.uuidCopyButton.addEventListener("click", copyUuidOutput);
+  els.uuidUppercase.addEventListener("change", generateUuids);
+  els.uuidHyphens.addEventListener("change", generateUuids);
+  generateUuids();
+}
+
+function generateUuidV4() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+}
+
+function generateUuids() {
+  const count = Math.min(100, Math.max(1, parseInt(els.uuidCount.value, 10) || 1));
+  els.uuidCount.value = String(count);
+  const uppercase = els.uuidUppercase.checked;
+  const hyphens = els.uuidHyphens.checked;
+  const list = [];
+  for (let index = 0; index < count; index += 1) {
+    let uuid = generateUuidV4();
+    if (!hyphens) uuid = uuid.replace(/-/g, "");
+    if (uppercase) uuid = uuid.toUpperCase();
+    list.push(uuid);
+  }
+  els.uuidOutput.textContent = list.join("\n");
+  els.uuidStatus.textContent = `已生成 ${count} 个`;
+}
+
+async function copyUuidOutput() {
+  const text = els.uuidOutput.textContent.trim();
+  if (!text || !/[0-9a-f]/i.test(text)) {
+    setMessage("暂无可复制的 UUID", true);
+    return;
+  }
+  try {
+    await writeClipboardText(text);
+    els.uuidStatus.textContent = "已复制";
+    setMessage("UUID 已复制到剪贴板");
+  } catch (error) {
+    setMessage(`复制失败：${error.message}`, true);
+  }
+}
+
 function formatJsonInput() {
   const rawText = els.jsonInput.value.trim();
   if (!rawText) {
@@ -4672,11 +4856,29 @@ function handleTableBodyKeyDown(event) {
 
 function handleTableBodyDoubleClick(event) {
   if (event.button !== 0) return;
-  const td = event.target.closest('td[data-editable-cell="true"]');
-  if (!td || !els.tbody.contains(td)) return;
-  hideCellTooltip();
-  event.preventDefault();
-  startCellEdit(td);
+  const editable = event.target.closest('td[data-editable-cell="true"]');
+  if (editable && els.tbody.contains(editable)) {
+    hideCellTooltip();
+    event.preventDefault();
+    startCellEdit(editable);
+    return;
+  }
+  // Non-editable data cells (e.g. the primary key, or read-only connections)
+  // can't be edited — double-click selects their text so it can be copied.
+  const selectable = event.target.closest('td[data-selectable-cell="true"]');
+  if (selectable && els.tbody.contains(selectable)) {
+    hideCellTooltip();
+    selectCellText(selectable);
+  }
+}
+
+function selectCellText(td) {
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(td);
+  selection.removeAllRanges();
+  selection.addRange(range);
 }
 
 function ensureCellTooltip() {
@@ -4940,7 +5142,6 @@ async function commitChanges() {
     for (const row of state.pendingInserts) {
       const values = {};
       state.activeTable.columns.forEach((column) => {
-        if (column.primary_key) return;
         const value = row[column.name];
         if (value !== undefined && value !== null && String(value).trim() !== "") {
           values[column.name] = value;
@@ -5066,6 +5267,8 @@ els.cancelDeleteButton.addEventListener("click", closeDeleteConnectionModal);
 els.confirmDeleteButton.addEventListener("click", confirmDeleteConnection);
 els.aiForm.addEventListener("submit", submitAiMessage);
 els.aiUseSqlButton.addEventListener("click", useAiSqlInEditor);
+els.aiSqlToggle.addEventListener("click", toggleAiSqlCollapsed);
+els.aiCopySqlButton.addEventListener("click", copyAllAiSql);
 els.aiResetButton.addEventListener("click", () => {
   resetAiSession().catch((error) => setMessage(`重置 AI 会话失败：${error.message}`, true));
 });
@@ -5112,6 +5315,7 @@ async function start() {
     setupToolTabs();
     setupTimestampTool();
     setupJsonTool();
+    setupUuidTool();
     state.connections = await loadStoredConnections();
     await loadAiSessionLinks();
     els.redisUrl.value = DEFAULT_REDIS_URL;
